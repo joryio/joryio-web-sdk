@@ -205,7 +205,7 @@ Messages arrive in one of two shapes:
 - **Native** - structured data (headline, body, image, buttons) written into plain DOM elements as text nodes. No iframe, no script execution.
 - **HTML** - author-supplied markup and CSS, shown in a sandboxed iframe.
 
-**HTML messages are off by default.** Joryio strips scripts and event handlers from HTML messages before sending them, but the iframe runs the SDK's own bootstrap and can execute script at your page's origin, so the residual risk is a sanitiser bypass. Opting in is a decision for your own team:
+**HTML messages are off by default.** Joryio keeps the markup as written; what stops an author's scripts and event handlers is the frame's Content-Security-Policy, which carries a fresh nonce per message so only the SDK's own bootstrap runs, and blocks network calls and form posts. The iframe can still execute script at your page's origin, so the residual risk is a gap in that policy, such as a browser that does not enforce it. Opting in is a decision for your own team:
 
 ```javascript
 const joryio = new JoryioSDK({

@@ -381,10 +381,13 @@ export class InAppMessagingManager {
   private iframes: Map<string, HTMLIFrameElement> = new Map();
 
   /**
-   * Whether HTML in-app messages may run. Off by default, because an HTML
-   * message executes author-supplied JavaScript on the host page - which is
-   * exactly why it is rendered in a sandboxed iframe. Native messages are
-   * unaffected: they are data rendered as DOM, with no interpreter.
+   * Whether HTML in-app messages are displayed. Off by default. The markup
+   * is kept as written by the server, and author scripts in it do NOT run:
+   * the frame's per-message nonce CSP (buildSrcdoc) lets only the SDK's own
+   * bridge bootstrap execute. But that frame can execute script at the host
+   * page's origin, so a gap in the CSP would be XSS - hence opt-in. Native
+   * messages are unaffected: they are data rendered as DOM, with no
+   * interpreter.
    */
   private allowHtmlJsInAppMessages = false;
 
@@ -1203,8 +1206,9 @@ export class InAppMessagingManager {
 
     if (kind === 'html') {
       if (!renderedHtml.trim()) return 'its `content.html` is empty';
-      // A SKIP, not a failure: HTML runs author-supplied JavaScript on the host
-      // page, so an integration that has not opted in never creates the iframe.
+      // A SKIP, not a failure: HTML is shown in a frame that can execute script
+      // at the host page's origin (only the SDK bridge, under the nonce CSP),
+      // so an integration that has not opted in never creates the iframe.
       if (!this.allowHtmlJsInAppMessages) {
         return 'it is an HTML message and allowHtmlJsInAppMessages is false';
       }
@@ -1459,11 +1463,14 @@ export class InAppMessagingManager {
     // Render the message HTML inside a SAME-ORIGIN SANDBOXED iframe. The sandbox
     // (allow-scripts allow-same-origin) is the isolation/encapsulation boundary
     // — message CSS can't leak to the host and host CSS can't bleed in — and it
-    // lets the message's own JS run AND reach `joryioBridge`. Same-origin is
-    // required so `joryioBridge.requestPushPermission()` keeps the click's
+    // lets the SDK's bridge bootstrap run AND reach `joryioBridge`. Same-origin
+    // is required so `joryioBridge.requestPushPermission()` keeps the click's
     // user-gesture activation (a cross-origin postMessage hop would lose it).
-    // Content is first-party (authored in-dashboard + sanitized server-side on
-    // save); the sandbox is defense-in-depth, not the only line.
+    // Author scripts and on* handlers do NOT run: the server keeps the markup
+    // as written (sanitizeInAppHtml drops only <base> and meta refresh), and
+    // the srcdoc's nonce CSP (buildSrcdoc) is what stops them. The sandbox and
+    // the navigation rules contain the rest; there is no server sanitiser in
+    // front of this.
     const iframe = document.createElement('iframe');
     iframe.id = `joryio-iframe-${campaign.id}`;
     // ── Native content: build DOM directly, no iframe ───────────────────────
@@ -1649,9 +1656,9 @@ export class InAppMessagingManager {
     let isDismissing = false;
 
     if (campaign.content?.kind !== 'native') {
-      // HTML runs author-supplied JavaScript on this page - which is why the
-      // iframe exists at all. An integration that has not opted in never creates
-      // one. This is a SKIP, not a failure: native messages still display,
+      // HTML is shown in an iframe that can execute script at this page's
+      // origin (only the SDK bridge - the nonce CSP blocks author script). An
+      // integration that has not opted in never creates one. This is a SKIP, not a failure: native messages still display,
       // because they are data rendered as DOM with no interpreter.
       if (!this.allowHtmlJsInAppMessages) {
         this.logger.warn(
@@ -1661,7 +1668,8 @@ export class InAppMessagingManager {
         return;
       }
 
-      // allow-scripts/allow-same-origin: run the message JS + reach the bridge.
+      // allow-scripts/allow-same-origin: run the SDK bridge bootstrap (the
+      // nonce CSP blocks every other script) + reach the host bridge.
       // allow-popups: a CTA may open a new tab. NOT allow-top-navigation: every
       // link and redirect goes through the bridge's `navigate`, which the HOST
       // page carries out (rule 57) - the message document itself may never
@@ -1800,8 +1808,9 @@ export class InAppMessagingManager {
    * event name, received `undefined`, and the host guard dropped it - a control
    * that looked like it worked and logged nothing. Verbs taking two arguments
    * (`navigate`) still cannot be driven declaratively.
-   * NOT sanitized here — the sandbox is the boundary and the HTML is first-party
-   * (dashboard-authored + sanitized server-side on save). campaignId + the host
+   * NOT sanitized here, nor by the server beyond <base> and meta refresh: the
+   * nonce CSP below is what keeps author script from running, and the sandbox
+   * and navigation rules contain the document. campaignId + the host
    * key are injected as JSON literals (our own values).
    */
   private buildSrcdoc(
@@ -1880,22 +1889,20 @@ export class InAppMessagingManager {
     /*
      * A per-document CSP, and the nonce is the point.
      *
-     * The server strips <script> and every on* handler before this HTML is
-     * sent, so no author JavaScript runs today. The residual risk is a
-     * SANITISER BYPASS - mXSS in HTML sanitisers is a recurring class - and
-     * because this iframe is `allow-scripts allow-same-origin`, injected script
-     * would run at the HOST PAGE'S ORIGIN. That is XSS on a customer's site,
-     * reachable from a compromised marketing account.
+     * The server keeps the author's markup as written (sanitizeInAppHtml drops
+     * only <base> and meta refresh), so author <script> blocks and on*
+     * handlers ARE in this document. Because this iframe is `allow-scripts
+     * allow-same-origin`, they would run at the HOST PAGE'S ORIGIN - XSS on a
+     * customer's site, reachable from a compromised marketing account.
      *
-     * `script-src 'nonce-...'` closes that: only the bootstrap below carries
-     * the nonce, so anything that survives sanitisation still cannot execute.
-     * Two independent controls instead of one, which matters when the first is
-     * a parser fighting an adversary.
+     * `script-src 'nonce-...'` is the control: only the bootstrap below carries
+     * the nonce, so nothing the author wrote executes. There is no server
+     * sanitiser in front of it; this CSP is the first line, not a backstop.
      *
      * The rest is least-privilege for content that is only ever a message:
      *   default-src 'none'  nothing is allowed unless named below
-     *   style-src unsafe-inline  the sanitiser ALLOWS style="" attributes, so
-     *                       this must stay permissive; styles cannot execute
+     *   style-src unsafe-inline  author style="" attributes are kept, so this
+     *                       must stay permissive; styles cannot execute
      *   img/media/font https: data:  no http subresources - the mixed-content
      *                       control Android enforced and iOS could not
      *   upgrade-insecure-requests  an author's http image is upgraded rather

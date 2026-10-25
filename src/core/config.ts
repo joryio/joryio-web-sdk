@@ -2,7 +2,7 @@
  * SDK Configuration Types and Defaults
  */
 
-export const SDK_VERSION = '1.3.1'; // keep in sync with package.json — the backend serves this in X-SDK-Version headers
+export const SDK_VERSION = '1.3.2'; // keep in sync with package.json — the backend serves this in X-SDK-Version headers
 export const DEFAULT_API_ENDPOINT = 'https://api-eu1.joryio.com/api';
 
 /**

@@ -96,7 +96,17 @@ export interface InAppCampaign {
    * verbatim on web. Server-rendered HTML is now the only thing sent.
    */
   content?:
-    | { kind: 'html'; html: string; css: string; assets?: unknown[] }
+    | {
+        kind: 'html';
+        html: string;
+        css: string;
+        assets?: unknown[];
+        /**
+         * Widest the message may be, in CSS px. Sent for `modal` and `slideup`,
+         * already resolved by the server; see inAppMaxWidth for the fallback.
+         */
+        maxWidth?: number;
+      }
     | {
         kind: 'native';
         title?: string;
@@ -200,6 +210,39 @@ export interface InAppBridge {
  */
 export function escapeStyleText(css: string): string {
   return typeof css === 'string' ? css.replace(/<\//g, '<\\/') : '';
+}
+
+/**
+ * The width a content-sized HTML message gets when its payload carries no
+ * `maxWidth` (a server that predates the field). The same two numbers as the
+ * backend's IN_APP_DEFAULT_MAX_WIDTH and every other SDK; the server normally
+ * sends the resolved value, so this is only ever a fallback.
+ */
+export const IN_APP_DEFAULT_MAX_WIDTH = { modal: 600, slideup: 400 } as const;
+
+/** Space kept between a content-sized message and each side of the viewport, in px. */
+export const IN_APP_VIEWPORT_MARGIN = 16;
+
+/**
+ * The maxWidth for this campaign, or null when its type is not content-sized
+ * (banner and fullscreen span the page; custom is the host's to place) or its
+ * content is native (the card has its own width).
+ */
+export function inAppMaxWidth(campaign: Pick<InAppCampaign, 'type' | 'content'>): number | null {
+  if (campaign.type !== 'modal' && campaign.type !== 'slideup') return null;
+  if (campaign.content?.kind !== 'html') return null;
+  const mw = campaign.content.maxWidth;
+  return typeof mw === 'number' && Number.isFinite(mw) && mw > 0 ? Math.floor(mw) : IN_APP_DEFAULT_MAX_WIDTH[campaign.type];
+}
+
+/**
+ * The width the message frame is given: min(maxWidth, viewport - margin on
+ * each side). Set BEFORE the content lays out, so the author's media queries
+ * see the width the message really has; only the height follows the content.
+ */
+export function inAppFrameWidth(maxWidth: number, viewportWidth: number, margin: number = IN_APP_VIEWPORT_MARGIN): number {
+  const available = Math.max(0, Math.floor(viewportWidth) - 2 * margin);
+  return Math.max(0, Math.min(Math.floor(maxWidth), available));
 }
 
 // Host-window key the in-app iframes call into (same-origin). Internal.
@@ -379,6 +422,14 @@ export class InAppMessagingManager {
   private claimed = new Set<string>();
   // Per-campaign content iframe (so we can auto-size + clean it up).
   private iframes: Map<string, HTMLIFrameElement> = new Map();
+  /**
+   * maxWidth of each displayed content-sized (modal / slideup) HTML message.
+   * Their frame width is derived from it and the host viewport, and re-derived
+   * when the viewport changes - see sizeContentFrame.
+   */
+  private frameMaxWidths: Map<string, number> = new Map();
+  private viewportListener?: () => void;
+  private viewportTimer?: ReturnType<typeof setTimeout>;
 
   /**
    * Whether HTML in-app messages are displayed. Off by default. The markup
@@ -582,10 +633,15 @@ export class InAppMessagingManager {
         this.trackImpression(campaignId, 'clicked').catch(() => {});
         return this.submitForm(campaignId, values);
       },
-      // Size the content iframe from the message's reported dimensions. For
-      // content-sized types (modal/slideup) both width + height track the content;
-      // banner/fullscreen stay full-width (height tracks content for banner).
-      setSize: (campaignId: string, width: number, height: number) => {
+      // Size the content iframe from the message's reported dimensions. Only
+      // the HEIGHT follows the content. The width is the host's decision:
+      // modal/slideup get min(maxWidth, viewport - margin) before the content
+      // lays out (sizeContentFrame), banner/fullscreen are 100%. Following the
+      // reported width is what made responsive messages impossible - the frame
+      // started narrow, the author's media queries fired, the content measured
+      // narrow, and the frame stayed narrow. `width` stays in the signature so
+      // the bridge every message calls is unchanged.
+      setSize: (campaignId: string, _width: number, height: number) => {
         // Guard on the iframe (the thing being sized), set synchronously in
         // display() — not displayedMessages, so a setSize on iframe-load is never
         // rejected by a timing gap.
@@ -593,9 +649,6 @@ export class InAppMessagingManager {
         if (!iframe || !Number.isFinite(height) || height <= 0) return;
         const type = this.displayedMessages.get(campaignId)?.campaign.type;
         iframe.style.height = type === 'fullscreen' ? '100%' : `${Math.ceil(height)}px`;
-        if ((type === 'modal' || type === 'slideup') && Number.isFinite(width) && width > 0) {
-          iframe.style.width = `${Math.ceil(width)}px`;
-        }
       },
     };
   }
@@ -1696,11 +1749,21 @@ export class InAppMessagingManager {
       });
       iframe.setAttribute('title', campaign.name || 'Message');
       // Start at 0 height (avoids the ~150px default-iframe flash); the bootstrap
-      // reports real size on load via the bridge's setSize. Banner/fullscreen fill
-      // width; modal/slideup get their content width from setSize.
+      // reports real height on load via the bridge's setSize. Banner/fullscreen
+      // fill the width; modal/slideup get min(maxWidth, viewport - margin) NOW,
+      // before the document loads, so its media queries see the real width.
       iframe.style.height = '0';
       if (campaign.type === 'banner' || campaign.type === 'fullscreen') {
         iframe.style.width = '100%';
+      }
+      const maxWidth = inAppMaxWidth(campaign);
+      if (maxWidth !== null) {
+        // The frame width already keeps the margin, so the container's own
+        // caps (90% for modal, 400px for slide-up) would only clip it.
+        container.style.maxWidth = 'none';
+        this.frameMaxWidths.set(campaign.id, maxWidth);
+        iframe.style.width = `${inAppFrameWidth(maxWidth, this.hostViewportWidth())}px`;
+        this.watchViewport();
       }
       iframe.srcdoc = this.buildSrcdoc(
         campaign.id,
@@ -1796,6 +1859,51 @@ export class InAppMessagingManager {
     this.logger.info(`Displayed campaign: ${campaign.name} (${campaign.id})`);
   }
 
+  /** The host page's layout width: without the scrollbar where the browser says so. */
+  private hostViewportWidth(): number {
+    const doc = typeof document !== 'undefined' ? document.documentElement : null;
+    const cw = doc && typeof doc.clientWidth === 'number' ? doc.clientWidth : 0;
+    if (cw > 0) return cw;
+    return typeof window !== 'undefined' && typeof window.innerWidth === 'number' ? window.innerWidth : 0;
+  }
+
+  /** Re-derive a content-sized frame's width from its maxWidth and the viewport. */
+  private sizeContentFrame(campaignId: string): void {
+    const iframe = this.iframes.get(campaignId);
+    const maxWidth = this.frameMaxWidths.get(campaignId);
+    if (!iframe || maxWidth === undefined) return;
+    iframe.style.width = `${inAppFrameWidth(maxWidth, this.hostViewportWidth())}px`;
+  }
+
+  /**
+   * Follow the viewport while a content-sized message is open: rotate a phone
+   * or narrow a window and the message is re-fitted (debounced). The content's
+   * ResizeObserver then reports the height at the new width.
+   */
+  private watchViewport(): void {
+    if (this.viewportListener || typeof window === 'undefined' || typeof window.addEventListener !== 'function') return;
+    this.viewportListener = () => {
+      if (this.viewportTimer) clearTimeout(this.viewportTimer);
+      this.viewportTimer = setTimeout(() => {
+        this.viewportTimer = undefined;
+        for (const id of this.frameMaxWidths.keys()) this.sizeContentFrame(id);
+      }, 100);
+    };
+    window.addEventListener('resize', this.viewportListener);
+  }
+
+  private unwatchViewportIfIdle(): void {
+    if (this.frameMaxWidths.size > 0 || !this.viewportListener) return;
+    if (typeof window !== 'undefined' && typeof window.removeEventListener === 'function') {
+      window.removeEventListener('resize', this.viewportListener);
+    }
+    this.viewportListener = undefined;
+    if (this.viewportTimer) {
+      clearTimeout(this.viewportTimer);
+      this.viewportTimer = undefined;
+    }
+  }
+
   /**
    * Build the iframe srcdoc: the message HTML + its CSS + a bootstrap that
    * (a) exposes `window.joryioBridge` (proxying same-origin to the host bridge),
@@ -1821,13 +1929,19 @@ export class InAppMessagingManager {
   ): string {
     const cid = JSON.stringify(campaignId);
     const key = JSON.stringify(HOST_BRIDGE_KEY);
-    // Content-sized types shrink the body to its content so scrollWidth reflects
-    // the authored width (the host sets the iframe to it). Full-bleed types keep
-    // body at full width (the host forces the iframe to 100%, ignoring width).
+    // Content-sized types: the HOST picks the width (min(maxWidth, viewport -
+    // margin)) and only the height follows the content. The body used to be
+    // inline-block so its width could be measured and the frame set to it -
+    // which let the frame start narrow and stay narrow. Now the body is a
+    // normal block at the frame's width; flow-root keeps the first and last
+    // child's margins inside it, so its height is the content's height.
+    // That height is measured from the BODY: the root's scrollHeight is never
+    // less than the frame itself, so a message that got shorter (wider
+    // viewport, a form message replaced by a line) could never shrink back.
     const contentSized = type === 'modal' || type === 'slideup';
-    const bodySizing = contentSized ? 'body{display:inline-block;max-width:100vw;}' : '';
+    const bodySizing = contentSized ? 'body{display:flow-root;}' : '';
     const bootstrap = `(function(){
-      var CID=${cid},KEY=${key};
+      var CID=${cid},KEY=${key},SIZED=${contentSized ? 'true' : 'false'};
       // Per-device visibility: tag the root with the REAL device class from the
       // HOST page viewport (the iframe is message-sized, so its own innerWidth is
       // useless here). The jr-vp-* → jr-hide-* rules in <style> then hide elements
@@ -1876,7 +1990,7 @@ export class InAppMessagingManager {
         var p=window.joryioBridge.submitForm(d);if(!p||typeof p.then!=='function'){msg('This form cannot be sent here.',false);f.removeAttribute('data-jry-busy');if(btn)btn.disabled=false;return}
         p.then(function(r){if(r&&r.ok){if(r.redirect){window.joryioBridge.navigate(r.redirect,'_top');return}var els2=f.querySelectorAll('input,select,textarea,button');for(var j=0;j<els2.length;j++){els2[j].disabled=true}msg(r.message||'Thank you.',true)}else{msg((r&&(r.message||(r.errors&&r.errors[0])))||'Something went wrong. Please try again.',false);f.removeAttribute('data-jry-busy');if(btn)btn.disabled=false}}).catch(function(){msg('Something went wrong. Please try again.',false);f.removeAttribute('data-jry-busy');if(btn)btn.disabled=false});
       },true);
-      function reportSize(){try{var b=document.body,de=document.documentElement;var w=Math.max(b?b.scrollWidth:0,de.scrollWidth);var h=Math.max(b?b.scrollHeight:0,de.scrollHeight);call('setSize',[w,h]);}catch(e){}}
+      function reportSize(){try{var b=document.body,de=document.documentElement;var w=Math.max(b?b.scrollWidth:0,de.scrollWidth);var h=SIZED&&b?Math.ceil(Math.max(b.scrollHeight,b.getBoundingClientRect?b.getBoundingClientRect().height:0)):Math.max(b?b.scrollHeight:0,de.scrollHeight);call('setSize',[w,h]);}catch(e){}}
       if(document.readyState!=='loading')reportSize();else document.addEventListener('DOMContentLoaded',reportSize);
       window.addEventListener('load',reportSize);
       try{if(window.ResizeObserver&&document.body){new ResizeObserver(reportSize).observe(document.body);}}catch(e){}
@@ -1991,6 +2105,8 @@ export class InAppMessagingManager {
       container.remove(); // also removes the child content iframe
     }
     this.iframes.delete(campaignId);
+    this.frameMaxWidths.delete(campaignId);
+    this.unwatchViewportIfIdle();
     if (backdrop) {
       backdrop.remove();
     }
@@ -2350,6 +2466,8 @@ export class InAppMessagingManager {
     this.displayedMessages.clear();
     this.watchedAttributes.clear();
     this.iframes.clear();
+    this.frameMaxWidths.clear();
+    this.unwatchViewportIfIdle();
 
     this.logger.info('In-app messaging state cleared');
   }
@@ -2415,6 +2533,8 @@ export class InAppMessagingManager {
     this.impressionTimestamps.clear();
     this.watchedAttributes.clear();
     this.iframes.clear();
+    this.frameMaxWidths.clear();
+    this.unwatchViewportIfIdle();
 
     // Tear down the host bridge so a later new JoryioSDK() rebinds a fresh one
     // (installHostBridge overwrites, but clearing here avoids a dangling closure

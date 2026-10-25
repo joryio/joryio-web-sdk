@@ -48,9 +48,10 @@ describe('a campaign that renders no content', () => {
     };
     // Frequency cap and eligibility are not what these tests are about.
     (m as any).checkFrequencyCap = () => true;
-    // HTML messages run author-supplied JavaScript on the host page, so an
-    // integration must opt in (allowHtmlJsInAppMessages) before the SDK draws
-    // one. These tests are about EMPTY content, not the opt-in, so opt in.
+    // HTML messages are shown in a frame that can execute script at the host
+    // page's origin (only the SDK bridge runs; author script is blocked by the
+    // CSP), so an integration must opt in (allowHtmlJsInAppMessages) before
+    // the SDK draws one. These tests are about EMPTY content, not the opt-in, so opt in.
     (m as any).allowHtmlJsInAppMessages = true;
     return { m, tracked, displayed };
   }

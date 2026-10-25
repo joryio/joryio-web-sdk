@@ -2,7 +2,7 @@
  * SDK Configuration Types and Defaults
  */
 
-export const SDK_VERSION = '1.3.0'; // keep in sync with package.json — the backend serves this in X-SDK-Version headers
+export const SDK_VERSION = '1.3.1'; // keep in sync with package.json — the backend serves this in X-SDK-Version headers
 export const DEFAULT_API_ENDPOINT = 'https://api-eu1.joryio.com/api';
 
 /**
@@ -88,17 +88,20 @@ export interface InAppOptions {
    *
    * What actually happens, because the name alone cannot carry it:
    *
-   * - The server strips `<script>` and every `on*` handler from the authored
-   *   HTML before it is sent, so author JavaScript does NOT run in normal
-   *   operation.
-   * - The message is still rendered in an iframe with `allow-scripts
-   *   allow-same-origin`, because this SDK's own bootstrap runs there (height
+   * - The server keeps the authored HTML as written (only `<base>` and
+   *   `<meta http-equiv="refresh">` are removed), so `<script>` and `on*`
+   *   handlers reach the browser - and do NOT run: the frame carries a fresh
+   *   nonce Content-Security-Policy per message, and only the SDK's bootstrap
+   *   has the nonce. Buttons and forms work through that bootstrap
+   *   (`data-joryio-action`, `data-jry-form`), not through author script.
+   * - The message is rendered in an iframe with `allow-scripts
+   *   allow-same-origin`, because the bootstrap runs there (height
    *   reporting, click logging, the host bridge). That frame therefore CAN
    *   execute script, at your page's origin.
-   * - So the residual risk is a sanitiser bypass: if one were ever found,
-   *   injected script would run with your origin's privileges. That is why
-   *   this is opt-in and why the name keeps `Js` - `allowHtmlInAppMessages`
-   *   alone would read like a formatting preference.
+   * - So the residual risk is a gap in the CSP (a browser that does not
+   *   enforce it): author script would then run with your origin's
+   *   privileges. That is why this is opt-in and why the name keeps `Js` -
+   *   `allowHtmlInAppMessages` alone would read like a formatting preference.
    *
    * Leaving it off does not disable in-app messaging: NATIVE messages still
    * display, because they are data rendered into DOM text nodes with no

@@ -81,7 +81,7 @@ The SDK files are served from one global host, `https://sdk.joryio.com`:
 | Path | What you get |
 |------|--------------|
 | `/web/1/<file>` | The newest 1.x release - recommended. Picks up fixes, never a breaking change |
-| `/web/<version>/<file>` | One exact version, e.g. `/web/1.3.0/joryio.min.js`. Its contents never change |
+| `/web/<version>/<file>` | One exact version, e.g. `/web/1.3.1/joryio.min.js`. Its contents never change |
 
 Files: `joryio.min.js` (the SDK), `joryio-sw.js` (the web push service worker) and `joryio.umd.js` (unminified UMD build).
 

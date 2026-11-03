@@ -40,6 +40,48 @@ const banner = `/**
  * @license Commercial - see https://github.com/joryio/joryio-web-sdk/blob/main/LICENSE
  */`;
 
+/**
+ * The script-tag build's module wrapper (dist/joryio.umd.js, dist/joryio.min.js).
+ *
+ * NOT Rollup's `format: 'umd'`: that wrapper calls an ANONYMOUS `define()`
+ * whenever the page has an AMD loader (`define.amd`), and runs the SDK only
+ * when the loader runs that module. Loaded by a plain <script> - the hosted
+ * file on sdk.joryio.com, the async snippet, the Magento / WooCommerce /
+ * PrestaShop / Shopify loaders - on a RequireJS page (every Magento Luma
+ * store) that anonymous define is a module RequireJS did not ask for: it
+ * either names it after whichever Magento module loads next (Magento's
+ * knockout template engine became the SDK - "templateEngine must inherit
+ * from ko.templateEngine", the checkout stuck on its spinner) or throws
+ * "Mismatched anonymous define() module", and `window.Joryio` was never set
+ * (owner QA 2026-10-26, Magento 2.4.7 Luma, SDK 1.3.2).
+ *
+ * So, the jQuery pattern: the SDK always runs and always sets its globals
+ * (`window.Joryio`, `JoryioSDK`), and an AMD page gets a define it can place:
+ *  - CommonJS (`module.exports`): exported, as before;
+ *  - RequireJS asked for this file (its <script> carries
+ *    `data-requiremodule`): an anonymous define, which RequireJS names after
+ *    the module it requested - `require(['anything-mapped-to-this-url'])`
+ *    keeps working;
+ *  - any other load on an AMD page: the NAMED define 'joryio-web-sdk', which
+ *    a loader queues without attaching it to another module.
+ * ES module and CommonJS builds are untouched (they have no wrapper).
+ * Pinned by src/umd-wrapper.spec.ts.
+ */
+const AMD_MODULE_ID = 'joryio-web-sdk';
+const scriptTagOutro = `
+(function (root, ns) {
+  if (typeof module === 'object' && module && typeof module.exports === 'object') { module.exports = ns; return; }
+  if (root) { root.JoryioSDK = ns; }
+  if (typeof define === 'function' && define.amd) {
+    var script = typeof document !== 'undefined' ? document.currentScript : null;
+    if (script && typeof script.getAttribute === 'function' && script.getAttribute('data-requiremodule')) {
+      define(function () { return ns; });
+    } else {
+      define('${AMD_MODULE_ID}', [], function () { return ns; });
+    }
+  }
+})(typeof globalThis !== 'undefined' ? globalThis : typeof self !== 'undefined' ? self : typeof window !== 'undefined' ? window : null, exports);`;
+
 const baseConfig = {
   input: 'src/index.ts',
   plugins: [
@@ -63,26 +105,28 @@ const baseConfig = {
 };
 
 export default [
-  // UMD build (for direct browser usage via <script> tag)
+  // Script-tag build, unminified (see scriptTagOutro for the wrapper)
   {
     ...baseConfig,
     output: {
       file: 'dist/joryio.umd.js',
-      format: 'umd',
+      format: 'iife',
       name: 'JoryioSDK',
+      outro: scriptTagOutro,
       banner,
       exports: 'named',
       globals: {},
     },
   },
 
-  // UMD minified build
+  // Script-tag build, minified - the hosted sdk.joryio.com file
   {
     ...baseConfig,
     output: {
       file: 'dist/joryio.min.js',
-      format: 'umd',
+      format: 'iife',
       name: 'JoryioSDK',
+      outro: scriptTagOutro,
       // No output.banner here — terser's `format.preamble` (below) already emits
       // the banner and survives minification; setting both duplicates it.
       exports: 'named',

@@ -1,4 +1,4 @@
-import { InAppMessagingManager, cssValue } from './inapp';
+import { InAppMessagingManager, cssValue, IN_APP_DISPLAY_DWELL_MS } from './inapp';
 import { installFakeDocument, uninstallFakeDocument, installFetch, RecordedRequest } from './test-harness';
 
 /**
@@ -127,7 +127,8 @@ describe('a delayed message is scheduled once (scan 2 #4)', () => {
     m.onEventTracked('Opened'); // e.g. the event fired again, or a re-sync
     await drain();
 
-    jest.advanceTimersByTime(2000);
+    // The delay, then the page-settle wait and the display dwell (IN_APP_DISPLAY_DWELL_MS).
+    await jest.advanceTimersByTimeAsync(2000 + IN_APP_DISPLAY_DWELL_MS + 100);
     await drain();
 
     expect(mounted.filter((el) => el.id === 'joryio-inapp-camp-1')).toHaveLength(1);

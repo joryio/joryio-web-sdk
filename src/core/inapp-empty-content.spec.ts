@@ -1,4 +1,4 @@
-import { InAppMessagingManager } from './inapp';
+import { InAppMessagingManager, IN_APP_DISPLAY_DWELL_MS } from './inapp';
 
 /**
  * A message with nothing to render must not be displayed, and must not be
@@ -89,11 +89,20 @@ describe('a campaign that renders no content', () => {
   it('still displays and tracks when there IS content', async () => {
     // The guard must not be so eager that it suppresses real messages - that
     // would trade a visible bug for a silent one.
-    const { m, tracked, displayed } = make();
+    jest.useFakeTimers();
+    try {
+      const { m, tracked, displayed } = make();
+      (m as any).isMounted = () => true; // display() is stubbed: nothing reaches a DOM
 
-    await (m as any).displayCampaign(campaign({ kind: 'html', html: '<p>hi</p>', css: '' }));
+      await (m as any).displayCampaign(campaign({ kind: 'html', html: '<p>hi</p>', css: '' }));
 
-    expect(displayed).toHaveLength(1);
-    expect(tracked).toEqual(['displayed']);
+      expect(displayed).toHaveLength(1);
+      // On screen, but not yet counted: that waits out the display dwell.
+      expect(tracked).toEqual([]);
+      await jest.advanceTimersByTimeAsync(IN_APP_DISPLAY_DWELL_MS);
+      expect(tracked).toEqual(['displayed']);
+    } finally {
+      jest.useRealTimers();
+    }
   });
 });

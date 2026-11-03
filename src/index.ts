@@ -65,6 +65,10 @@ export type {
 // Export SDK version
 export { SDK_VERSION } from './core/config';
 
+// How long an in-app message must be visible before it counts as displayed
+// (the same constant on every Joryio SDK).
+export { IN_APP_DISPLAY_DWELL_MS } from './core/inapp';
+
 // Default export for convenience
 export default JoryioSDK;
 

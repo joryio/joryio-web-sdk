@@ -104,7 +104,7 @@ describe('a delayed display is tied to the generation and to canSend (scan 4 #7,
     const m = make();
     await m.sync();
     m.onEventTracked('Opened');
-    await settle(20);
+    await settle(100); // the page-settle wait before the message mounts
     expect(containers()).toBe(1);
     allowed = false;
     await m.dismiss('c1', 'close_button');

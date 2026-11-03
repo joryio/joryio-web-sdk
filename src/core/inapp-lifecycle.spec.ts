@@ -1,4 +1,4 @@
-import { InAppMessagingManager } from './inapp';
+import { InAppMessagingManager, IN_APP_DISPLAY_DWELL_MS } from './inapp';
 import { installFakeDocument, uninstallFakeDocument, installFetch, RecordedRequest, settle } from './test-harness';
 
 /**
@@ -71,7 +71,7 @@ describe('native in-app messages', () => {
     (m as any).campaigns.set('camp-n', nativeCampaign());
 
     await m.displayCampaign(nativeCampaign());
-    await settle(5);
+    await settle(IN_APP_DISPLAY_DWELL_MS + 100);
 
     expect(tracks().filter((t) => t.displayedAt)).toHaveLength(1);
     expect(onDisplay).toHaveBeenCalledTimes(1);
@@ -106,7 +106,7 @@ describe('native in-app messages', () => {
     const m = make();
     (m as any).campaigns.set('camp-n', nativeCampaign());
     await m.displayCampaign(nativeCampaign());
-    await settle(5);
+    await settle(IN_APP_DISPLAY_DWELL_MS + 100);
     const t = tracks()[0];
     expect(t.externalId).toBeUndefined();
     expect(t.anonymousId).toBe('anon-1');

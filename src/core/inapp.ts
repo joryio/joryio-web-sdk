@@ -258,6 +258,32 @@ const MAX_DISPLAYED_MESSAGES = 500;
 const MAX_IMPRESSION_TIMESTAMPS = 500;
 const MAX_WATCHED_ATTRIBUTES = 200;
 
+/**
+ * How long (ms) a message must have been on screen - page visible, message
+ * mounted, page not unloading - before it counts as displayed: only then is
+ * `in_app.displayed` reported and the local frequency cap consumed. Same name
+ * and value in every SDK (backend sdk-inapp-display-dwell-parity.spec.ts).
+ *
+ * Why: a message mounted during a sign-in redirect or a logout - served and
+ * "displayed" in the same second, seen at most as a flash - used to be counted,
+ * which spent the campaign's frequency cap on a message nobody could read
+ * (prod 2026-11-02/03, BACKLOG D320). A click or a dismiss before the dwell
+ * means the person saw it: it counts as displayed, then clicked/dismissed.
+ */
+export const IN_APP_DISPLAY_DWELL_MS = 1000;
+/** No requestIdleCallback (Safari): wait this long after `load` instead. */
+const PAGE_SETTLE_FALLBACK_MS = 50;
+/** requestIdleCallback's timeout: a page that is never idle still shows the message. */
+const PAGE_SETTLE_IDLE_TIMEOUT_MS = 500;
+/** `load` never fired (a hung resource): stop waiting for it after this. */
+const PAGE_LOAD_MAX_WAIT_MS = 10_000;
+/**
+ * Dismiss actions a PERSON takes on the message. Any other dismiss (reset,
+ * destroy, the host's dismissInAppMessage, a blocked frame navigation) before
+ * the dwell reports nothing: there is no evidence anyone saw the message.
+ */
+const USER_DISMISS_ACTIONS = new Set(['close_button', 'backdrop', 'button', 'bridge_close']);
+
 /** The shape of a parsed CSS rule this module cares about - a structural
  *  subset of CSSOM, so the rewriting below is testable without a browser. */
 interface ScopableRule {
@@ -420,6 +446,17 @@ export class InAppMessagingManager {
    * burst cannot both pass the "already shown?" check (contract item 27).
    */
   private claimed = new Set<string>();
+  /**
+   * Messages on screen that have not yet counted as displayed, with their
+   * dwell timer (null while paused: page hidden or unloading) and the
+   * generation they were shown under. See IN_APP_DISPLAY_DWELL_MS.
+   */
+  private awaitingDwell = new Map<string, { timer: ReturnType<typeof setTimeout> | null; generation: number }>();
+  /** beforeunload/pagehide seen and not yet undone (pageshow, visible again, or interaction). */
+  private pageLeaving = false;
+  /** Pending "wait for the page to settle" promises, resolved false when the page starts leaving. */
+  private settleWaiters = new Set<() => void>();
+  private pageListeners: Array<[any, string, () => void]> = [];
   // Per-campaign content iframe (so we can auto-size + clean it up).
   private iframes: Map<string, HTMLIFrameElement> = new Map();
   /**
@@ -521,6 +558,186 @@ export class InAppMessagingManager {
     this.auth = auth || null;
     this.loadImpressionTimestamps();
     this.installHostBridge();
+    this.installPageLifecycle();
+  }
+
+  // ---------------------------------------------------------------------------
+  // When a message may appear, and when it counts as displayed
+  // (IN_APP_DISPLAY_DWELL_MS).
+  // ---------------------------------------------------------------------------
+
+  private pageHidden(): boolean {
+    if (typeof document === 'undefined') return false;
+    return (document as any).visibilityState === 'hidden' || (document as any).hidden === true;
+  }
+
+  /**
+   * Watch the page leaving and coming back. `beforeunload` is the one that
+   * matters for a sign-in redirect or a logout link: it fires when navigation
+   * STARTS, while `pagehide` waits for the next page to be ready.
+   */
+  private installPageLifecycle(): void {
+    if (typeof window === 'undefined' || typeof (window as any).addEventListener !== 'function') return;
+    const on = (target: any, type: string, fn: () => void) => {
+      if (!target || typeof target.addEventListener !== 'function') return;
+      target.addEventListener(type, fn);
+      this.pageListeners.push([target, type, fn]);
+    };
+    const leaving = () => {
+      this.pageLeaving = true;
+      this.pauseDwells();
+      this.settleWaiters.forEach((cancel) => cancel());
+    };
+    // The page is still here after all: bfcache restore, a cancelled
+    // "leave site?" prompt or a download link (the person then interacts).
+    const stayed = () => {
+      if (!this.pageLeaving) return;
+      this.pageLeaving = false;
+      this.resumeDwells();
+    };
+    on(window, 'beforeunload', leaving);
+    on(window, 'pagehide', leaving);
+    on(window, 'pageshow', () => {
+      this.pageLeaving = false;
+      this.resumeDwells();
+    });
+    on(window, 'pointerdown', stayed);
+    on(window, 'keydown', stayed);
+    if (typeof document !== 'undefined') {
+      on(document, 'visibilitychange', () => {
+        if (this.pageHidden()) {
+          this.pauseDwells();
+        } else {
+          this.pageLeaving = false;
+          this.resumeDwells();
+        }
+      });
+    }
+  }
+
+  private removePageLifecycle(): void {
+    for (const [target, type, fn] of this.pageListeners) {
+      try {
+        target.removeEventListener?.(type, fn);
+      } catch {
+        // best-effort
+      }
+    }
+    this.pageListeners = [];
+  }
+
+  /**
+   * Resolves true once the page has finished loading and gone idle - the
+   * point at which a message can be read - or false if the page starts to
+   * unload first (or the manager is stopped). A message is never mounted into
+   * a page that is on its way out.
+   */
+  private whenPageSettled(): Promise<boolean> {
+    if (typeof window === 'undefined' || typeof document === 'undefined') return Promise.resolve(true);
+    if (this.pageLeaving) return Promise.resolve(false);
+    return new Promise<boolean>((resolve) => {
+      let done = false;
+      let loadTimer: ReturnType<typeof setTimeout> | undefined;
+      let idleTimer: ReturnType<typeof setTimeout> | undefined;
+      const w = window as any;
+      const finish = (ok: boolean) => {
+        if (done) return;
+        done = true;
+        this.settleWaiters.delete(cancel);
+        if (loadTimer) clearTimeout(loadTimer);
+        if (idleTimer) clearTimeout(idleTimer);
+        if (typeof w.removeEventListener === 'function') w.removeEventListener('load', onLoad);
+        resolve(ok && !this.pageLeaving);
+      };
+      const cancel = () => finish(false);
+      const idle = () => {
+        if (done) return;
+        if (typeof w.requestIdleCallback === 'function') {
+          w.requestIdleCallback(() => finish(true), { timeout: PAGE_SETTLE_IDLE_TIMEOUT_MS });
+        } else {
+          idleTimer = setTimeout(() => finish(true), PAGE_SETTLE_FALLBACK_MS);
+        }
+      };
+      const onLoad = () => {
+        if (loadTimer) clearTimeout(loadTimer);
+        loadTimer = undefined;
+        idle();
+      };
+      this.settleWaiters.add(cancel);
+      const state = (document as any).readyState;
+      if (!state || state === 'complete' || typeof w.addEventListener !== 'function') {
+        idle();
+      } else {
+        w.addEventListener('load', onLoad, { once: true });
+        loadTimer = setTimeout(onLoad, PAGE_LOAD_MAX_WAIT_MS);
+      }
+    });
+  }
+
+  private isMounted(campaignId: string): boolean {
+    if (!this.displayedMessages.has(campaignId) || typeof document === 'undefined') return false;
+    const el: any = document.getElementById(`joryio-inapp-${campaignId}`);
+    return !!el && el.isConnected !== false;
+  }
+
+  /** Start (or restart) the dwell for a message now on screen. */
+  private scheduleDwell(campaignId: string, generation: number): void {
+    const existing = this.awaitingDwell.get(campaignId);
+    if (existing?.timer) clearTimeout(existing.timer);
+    if (this.pageLeaving || this.pageHidden()) {
+      this.awaitingDwell.set(campaignId, { timer: null, generation });
+      return;
+    }
+    const timer = setTimeout(() => {
+      const entry = this.awaitingDwell.get(campaignId);
+      if (!entry || entry.timer !== timer) return;
+      entry.timer = null;
+      // Still on screen, page still visible and staying, still the same person.
+      if (this.pageLeaving || this.pageHidden() || !this.isMounted(campaignId)) return;
+      if (entry.generation !== this.generation) return;
+      this.confirmDisplay(campaignId).catch(() => undefined);
+    }, IN_APP_DISPLAY_DWELL_MS);
+    this.awaitingDwell.set(campaignId, { timer, generation });
+  }
+
+  /** Page hidden or leaving: the dwell starts again from zero when it is back. */
+  private pauseDwells(): void {
+    this.awaitingDwell.forEach((entry) => {
+      if (entry.timer) clearTimeout(entry.timer);
+      entry.timer = null;
+    });
+  }
+
+  private resumeDwells(): void {
+    if (this.pageLeaving || this.pageHidden()) return;
+    this.awaitingDwell.forEach((entry, campaignId) => {
+      if (!entry.timer && this.isMounted(campaignId)) this.scheduleDwell(campaignId, entry.generation);
+    });
+  }
+
+  /** Forget a message's dwell without counting it. */
+  private dropDwell(campaignId: string): void {
+    const entry = this.awaitingDwell.get(campaignId);
+    if (entry?.timer) clearTimeout(entry.timer);
+    this.awaitingDwell.delete(campaignId);
+  }
+
+  /**
+   * The message counts as displayed: consume the frequency cap (persisted, so
+   * 'once'/'session' caps survive reloads) and report `in_app.displayed`.
+   * Once per mount - a no-op for a message already confirmed.
+   */
+  private confirmDisplay(campaignId: string): Promise<void> {
+    if (!this.awaitingDwell.has(campaignId)) return Promise.resolve();
+    this.dropDwell(campaignId);
+    const timestamps = this.impressionTimestamps.get(campaignId) || [];
+    timestamps.push(Date.now());
+    this.boundedMapSet(this.impressionTimestamps, campaignId, timestamps, MAX_IMPRESSION_TIMESTAMPS);
+    this.persistImpressionTimestamps();
+    const reported = this.trackImpression(campaignId, 'displayed');
+    const message = this.displayedMessages.get(campaignId);
+    if (message) this.callHost('onMessageDisplay', () => this.displayOptions.onDisplay?.(message));
+    return reported;
   }
 
   /**
@@ -699,6 +916,8 @@ export class InAppMessagingManager {
     this.syncRetried = false;
     this.pendingDelays.forEach((timer) => clearTimeout(timer));
     this.pendingDelays.clear();
+    // Messages waiting for the page to settle are not shown after a stop.
+    this.settleWaiters.forEach((cancel) => cancel());
   }
 
   /**
@@ -1147,35 +1366,50 @@ export class InAppMessagingManager {
         return;
       }
 
-      const message: InAppMessage = {
-        campaign,
-        renderedHtml,
-        displayedAt: new Date(),
+      /**
+       * Putting the message on screen. NOT yet "displayed": registering it
+       * (displayedMessages, so the content frame's bridge calls are accepted),
+       * mounting it, and starting its dwell. Only once it has been visible for
+       * IN_APP_DISPLAY_DWELL_MS - or the person clicked or dismissed it - does
+       * confirmDisplay() consume the frequency cap and report `in_app.displayed`.
+       *
+       * Registering BEFORE any impression is deliberate: the content iframe's
+       * bootstrap calls back (setSize/logClick/...) on load, and the host-bridge
+       * guards key off displayedMessages.
+       *
+       * Recording the cap at mount time (as this used to) counted a message
+       * mounted during a sign-in redirect or a logout - a flash nobody could
+       * read - and spent the campaign's cap on it (prod 2026-11-02/03).
+       */
+      const commitDisplay = () => {
+        const message: InAppMessage = {
+          campaign,
+          renderedHtml,
+          displayedAt: new Date(),
+        };
+        this.boundedMapSet(this.displayedMessages, campaign.id, message, MAX_DISPLAYED_MESSAGES);
+        this.display(message);
+        this.scheduleDwell(campaign.id, generation);
       };
 
       /**
-       * Everything that means "this was shown", in one place.
-       *
-       * Registering the message BEFORE the async impression-track is deliberate:
-       * the content iframe's bootstrap calls back (setSize/logClick/...) on load,
-       * which fires before a network trackImpression resolves, and the
-       * host-bridge guards key off displayedMessages - so registering after would
-       * leave the iframe rejected and stuck at height:0.
-       *
-       * All of it happens at DISPLAY time, including the frequency-cap
-       * timestamp. Recording the cap when the message was merely SCHEDULED burns
-       * an impression on a message the user never saw - which is precisely the
-       * bug fixed on iOS earlier (an impression tracked before a render that then
-       * failed), and my delay had just reintroduced it here.
+       * Wait for the page to settle (loaded and idle) and never show into a
+       * page that is unloading; then re-check everything that may have
+       * changed during the wait.
        */
-      const commitDisplay = () => {
-        this.boundedMapSet(this.displayedMessages, campaign.id, message, MAX_DISPLAYED_MESSAGES);
-        const timestamps = this.impressionTimestamps.get(campaign.id) || [];
-        timestamps.push(Date.now());
-        this.boundedMapSet(this.impressionTimestamps, campaign.id, timestamps, MAX_IMPRESSION_TIMESTAMPS);
-        // Persist so 'once'/'lifetime'/'session' caps survive reloads and sessions.
-        this.persistImpressionTimestamps();
-        this.display(message);
+      const show = async (): Promise<void> => {
+        if (!(await this.whenPageSettled())) {
+          this.logger.debug(`Campaign ${campaign.id} not displayed: the page is unloading. It stays eligible.`);
+          return;
+        }
+        if (generation !== this.generation || !this.runtime.canSend()) {
+          this.logger.debug(`Campaign ${campaign.id} not displayed: the visitor or consent changed`);
+          return;
+        }
+        // The cap may have been spent meanwhile (manual displayInAppCampaign,
+        // another tab's impression after a reload).
+        if (this.displayedMessages.has(campaign.id) || !this.checkFrequencyCap(campaign)) return;
+        commitDisplay();
       };
 
       // Display delay: the campaign's `delay` is SECONDS to wait after the
@@ -1188,17 +1422,14 @@ export class InAppMessagingManager {
           this.pendingDelays.delete(campaign.id);
           // Tied to WHO and WHETHER (contract item 43): an identify of another
           // user (even without reset()), an opt-out or a consent change while
-          // the delay ran bumps the generation, and the message was the
-          // previous audience's - or may no longer be shown at all.
-          if (generation !== this.generation || !this.runtime.canSend()) {
-            this.logger.debug(`Campaign ${campaign.id} not displayed after its delay: the visitor or consent changed`);
-            return;
-          }
-          // Re-checked at display time: the cap may have been spent meanwhile
-          // (manual displayInAppCampaign, another tab's impression after a reload).
-          if (this.displayedMessages.has(campaign.id) || !this.checkFrequencyCap(campaign)) return;
-          commitDisplay();
-          this.trackImpression(campaign.id, 'displayed').catch(() => undefined);
+          // the delay ran bumps the generation - show() re-checks it.
+          if (this.claimed.has(id) || this.displayedMessages.has(id)) return;
+          // Claimed again for the settle wait, so a trigger meanwhile cannot
+          // schedule a second copy (contract item 27).
+          this.claimed.add(id);
+          show()
+            .catch((error) => this.logger.error('In-app display failed:', error))
+            .finally(() => this.claimed.delete(id));
         }, delayMs);
         // Tracked so dismiss()/clear() can cancel a message that has not appeared
         // yet, instead of it popping up after the user navigated away.
@@ -1206,10 +1437,7 @@ export class InAppMessagingManager {
         return;
       }
 
-      commitDisplay();
-
-      // Track impression (fire-and-forget analytics; the message is already shown)
-      await this.trackImpression(campaign.id, 'displayed');
+      await show();
     } finally {
       this.claimed.delete(id);
     }
@@ -1853,8 +2081,8 @@ export class InAppMessagingManager {
 
     targetContainer.appendChild(container);
 
-    // Call onDisplay callback
-    this.callHost('onMessageDisplay', () => this.displayOptions.onDisplay?.(message));
+    // onDisplay is NOT called here: it fires when the message counts as
+    // displayed (confirmDisplay), paired with the `displayed` report - as on iOS.
 
     this.logger.info(`Displayed campaign: ${campaign.name} (${campaign.id})`);
   }
@@ -2096,6 +2324,22 @@ export class InAppMessagingManager {
       this.pendingDelays.delete(campaignId);
     }
 
+    // Removed before it counted as displayed (IN_APP_DISPLAY_DWELL_MS). The
+    // person closing it is evidence they saw it: it counts as displayed, then
+    // dismissed. Any other removal (reset, destroy, the host's
+    // dismissInAppMessage) reports nothing and leaves the cap untouched.
+    let report = true;
+    const dwell = this.awaitingDwell.get(campaignId);
+    if (dwell) {
+      // Shown to the previous visitor (identify/consent changed since): not theirs to count.
+      if (USER_DISMISS_ACTIONS.has(action) && dwell.generation === this.generation) {
+        this.confirmDisplay(campaignId).catch(() => undefined);
+      } else {
+        this.dropDwell(campaignId);
+        report = false;
+      }
+    }
+
     const container = document.getElementById(`joryio-inapp-${campaignId}`);
     const backdrop = document.getElementById(`joryio-backdrop-${campaignId}`);
     const style = document.getElementById(`joryio-style-${campaignId}`);
@@ -2125,7 +2369,7 @@ export class InAppMessagingManager {
       // the wire carries the vocabulary value, which trackImpression sets.
       // The slot is released whatever happens to the report (sending blocked,
       // a failed request) - contract item 43.
-      await this.trackImpression(campaignId, 'dismissed').catch(() => undefined);
+      if (report) await this.trackImpression(campaignId, 'dismissed').catch(() => undefined);
 
       this.callHost('onMessageDismiss', () => this.displayOptions.onDismiss?.(message, action));
 
@@ -2192,6 +2436,15 @@ export class InAppMessagingManager {
     if (!campaign) return;
     // Opted out / consent pending / suspended: an impression is tracking too.
     if (!this.runtime.canSend()) return;
+    // A click or conversion before the dwell ran out: the person saw it, so
+    // it counts as displayed first (started, not awaited, so the reports
+    // leave in the order they happened).
+    const dwell = type !== 'displayed' ? this.awaitingDwell.get(campaignId) : undefined;
+    if (dwell) {
+      // Shown before the visitor changed (identify, consent): report nothing for it.
+      if (dwell.generation !== this.generation) return;
+      this.confirmDisplay(campaignId).catch(() => undefined);
+    }
 
     const sessionId = this.session.getSessionId();
 
@@ -2464,6 +2717,8 @@ export class InAppMessagingManager {
     // stored caps of every other campaign were silently erased.
     this.campaigns.clear();
     this.displayedMessages.clear();
+    // Dropped uncounted: the dismissals above already did, this is belt and braces.
+    this.awaitingDwell.forEach((_entry, campaignId) => this.dropDwell(campaignId));
     this.watchedAttributes.clear();
     this.iframes.clear();
     this.frameMaxWidths.clear();
@@ -2530,6 +2785,8 @@ export class InAppMessagingManager {
     // Clear caches
     this.campaigns.clear();
     this.displayedMessages.clear();
+    this.awaitingDwell.forEach((_entry, campaignId) => this.dropDwell(campaignId));
+    this.removePageLifecycle();
     this.impressionTimestamps.clear();
     this.watchedAttributes.clear();
     this.iframes.clear();

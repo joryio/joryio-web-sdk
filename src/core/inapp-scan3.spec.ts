@@ -1,4 +1,7 @@
-import { InAppMessagingManager } from './inapp';
+import { InAppMessagingManager, IN_APP_DISPLAY_DWELL_MS } from './inapp';
+
+/** The page-settle wait plus the display dwell: a message counts as displayed after this. */
+const DWELL_WAIT = IN_APP_DISPLAY_DWELL_MS + 150;
 import { installFakeDocument, uninstallFakeDocument, installFetch, RecordedRequest, settle, waitFor } from './test-harness';
 
 /**
@@ -81,7 +84,7 @@ describe('one display per trigger burst (finding 2, item 27)', () => {
     await m.sync();
     m.onEventTracked('Opened');
     m.onEventTracked('Opened');
-    await settle(30);
+    await settle(DWELL_WAIT);
     expect(containers()).toBe(1);
     expect(displayedReports()).toBe(1);
   });
@@ -98,7 +101,7 @@ describe('one display per trigger burst (finding 2, item 27)', () => {
     await m.sync();
     m.onEventTracked('Opened');
     m.onEventTracked('Opened');
-    await settle(30);
+    await settle(DWELL_WAIT);
     expect(calls.filter((c) => c.path.endsWith('/v1/in-app/resolve'))).toHaveLength(1);
     expect(displayedReports()).toBe(1);
   });
@@ -111,7 +114,7 @@ describe('one display per trigger burst (finding 2, item 27)', () => {
     m.onEventTracked('Opened');
     await jest.advanceTimersByTimeAsync(10);
     m.onEventTracked('Opened');
-    await jest.advanceTimersByTimeAsync(2500);
+    await jest.advanceTimersByTimeAsync(2500 + DWELL_WAIT);
     expect(containers()).toBe(1);
     expect(displayedReports()).toBe(1);
   });
@@ -164,7 +167,7 @@ describe('host callbacks that throw (finding 12, item 34)', () => {
     });
     await m.sync();
     m.onEventTracked('Opened');
-    await settle(30);
+    await settle(DWELL_WAIT);
     expect(containers()).toBe(1);
     expect(displayedReports()).toBe(1);
   });

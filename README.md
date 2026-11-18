@@ -33,7 +33,7 @@ If `init` fails (a missing or malformed SDK key - the reason is logged to the co
 
 ```html
 <script>
-  !function(){var e=window.joryio=window.joryio||[];if(!e.initialize)if(e.invoked)window.console&&console.error&&console.error("Joryio snippet included twice.");else{e.invoked=!0,e.methods=["init","track","identify","addAlias","setAttributes","setAttribute","incrementAttribute","unsetAttribute","addToArray","removeFromArray","reset","flush","optOut","optIn","updateConsent","getTrackingConsent","isUserOptedOut","setSdkAuthenticationToken","setSdkAuthenticationErrorCallback","getAnonymousId","getUserId","ready","getIdentity","getSessionInfo","getUTMData","updateUTM","syncInAppCampaigns","getInAppCampaigns","displayInAppCampaign","dismissInAppMessage","trackInAppConversion","ecommerce","wipeData","destroy"],e.keep=["init","optOut","optIn","updateConsent","wipeData"],e.factory=function(t){return function(){var n=Array.prototype.slice.call(arguments);if(n.unshift(t),e.length>=1e3)for(var i=0;i<e.length;i++)if(e.keep.indexOf(e[i][0])<0){e.splice(i,1);break}return e.push(n),/^(get|is)[A-Z]/.test(t)?void 0:e}};for(var t=0;t<e.methods.length;t++){var n=e.methods[t];e[n]=e.factory(n)}e.load=function(e){var t=document.createElement("script");t.type="text/javascript",t.async=!0,t.src="https://sdk.joryio.com/web/1/joryio.min.js";var n=document.getElementsByTagName("script")[0];n.parentNode.insertBefore(t,n)},e.load()}}();
+  !function(){var e=window.joryio=window.joryio||[];if(!e.initialize)if(e.invoked)window.console&&console.error&&console.error("Joryio snippet included twice.");else{e.invoked=!0,e.methods=["init","track","identify","identifyFromLink","addAlias","setAttributes","setAttribute","incrementAttribute","unsetAttribute","addToArray","removeFromArray","reset","resetTo","flush","optOut","optIn","updateConsent","getTrackingConsent","isUserOptedOut","setSdkAuthenticationToken","setSdkAuthenticationErrorCallback","setStorefrontIdentityToken","setStorefrontIdentityTokenProvider","getAnonymousId","getUserId","ready","getIdentity","getSessionInfo","getUTMData","updateUTM","syncInAppCampaigns","getInAppCampaigns","displayInAppCampaign","dismissInAppMessage","trackInAppConversion","ecommerce","wipeData","destroy"],e.keep=["init","optOut","optIn","updateConsent","wipeData"],e.factory=function(t){return function(){var n=Array.prototype.slice.call(arguments);if(n.unshift(t),e.length>=1e3)for(var i=0;i<e.length;i++)if(e.keep.indexOf(e[i][0])<0){e.splice(i,1);break}return e.push(n),/^(get|is)[A-Z]/.test(t)?void 0:e}};for(var t=0;t<e.methods.length;t++){var n=e.methods[t];e[n]=e.factory(n)}e.load=function(e){var t=document.createElement("script");t.type="text/javascript",t.async=!0,t.src="https://sdk.joryio.com/web/1/joryio.min.js";var n=document.getElementsByTagName("script")[0];n.parentNode.insertBefore(t,n)},e.load()}}();
   joryio.init({ sdkKey: 'jry_sdk_web_YOUR_SDK_KEY' });
 </script>
 ```
@@ -81,7 +81,7 @@ The SDK files are served from one global host, `https://sdk.joryio.com`:
 | Path | What you get |
 |------|--------------|
 | `/web/1/<file>` | The newest 1.x release - recommended. Picks up fixes, never a breaking change |
-| `/web/<version>/<file>` | One exact version, e.g. `/web/1.3.2/joryio.min.js`. Its contents never change |
+| `/web/<version>/<file>` | One exact version, e.g. `/web/1.3.3/joryio.min.js`. Its contents never change |
 
 Files: `joryio.min.js` (the SDK), `joryio-sw.js` (the web push service worker) and `joryio.umd.js` (unminified UMD build).
 
@@ -461,6 +461,16 @@ await joryio.destroy(); // flush, stop every timer and remove listeners
 ```
 
 The SDK never throws into your page. A missing or malformed `sdkKey` is logged once (always, whatever the log level) and the instance ignores every call; a `null` argument where one is required is logged and ignored.
+
+## Recognise people who click your messages
+
+Links in Joryio messages land with a `jr_t` parameter (when the workspace setting "Recognise people who click your messages" is on and the link goes to one of the workspace's websites). The SDK removes it from the address bar at once and, when tracking is allowed and nobody is identified on the browser, sends it to Joryio so the visit and its events are attributed to the person who was sent the message - attribution only: nothing is written to that contact's profile. Add this site to "Your websites" in the setting. A single-page app that handles URLs itself can pass one in:
+
+```js
+joryio.identifyFromLink(window.location.href);
+```
+
+A link never overrides an `identify()`-ed user or a signed-in store customer, and a browser that is already someone else stays that person.
 
 ## TypeScript
 

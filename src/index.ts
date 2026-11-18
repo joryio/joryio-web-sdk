@@ -12,6 +12,7 @@ import type {
   SdkAuthFailureInfo,
   SdkAuthFailureReason,
   SdkAuthFailureCallback,
+  StorefrontIdentityTokenProvider,
 } from './core/network';
 import { User, SubscriptionStatus } from './core/user';
 import type { SubscriptionChannel, SubscriptionPreferences } from './core/user';
@@ -60,6 +61,7 @@ export type {
   SdkAuthFailureInfo,
   SdkAuthFailureReason,
   SdkAuthFailureCallback,
+  StorefrontIdentityTokenProvider,
 };
 
 // Export SDK version

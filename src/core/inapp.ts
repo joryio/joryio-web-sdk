@@ -18,8 +18,13 @@ import { SdkAuthFailureInfo } from './network';
  */
 export interface InAppAuthProvider {
   /** `subjectUserId`: whose request it is - a logged-out user's carries that user's own token. */
-  getSdkAuthHeaders(subjectUserId?: string | null): Record<string, string>;
+  /** `anonymousId`: the visitor the request names (D383: a storefront token goes only with its own visitor). */
+  getSdkAuthHeaders(subjectUserId?: string | null, anonymousId?: string | null): Record<string, string>;
   isSdkAuthError(status: number, data: any): boolean;
+  /** D383: a 401 `storefront_identity_error` (optional so test stubs need not have it). */
+  isStorefrontIdentityError?(status: number, data: any): boolean;
+  /** D383: refresh (expired) or drop the storefront token, so the NEXT call carries a good one or none. */
+  handleStorefrontIdentityError?(data: any): Promise<boolean>;
   refreshSdkAuthToken(info: SdkAuthFailureInfo): Promise<string | undefined>;
   /** The signed-in user; the host's auth handler is only asked about THEIR requests (contract item 39). */
   getCurrentUserId?(): string | null;
@@ -84,6 +89,13 @@ export interface InAppCampaign {
    * IN_APP_REQUIRE_DELIVERY_TOKEN is switched on.
    */
   deliveryToken?: string;
+  /**
+   * Joryio-signed proof that THIS form was served to THIS visitor (present
+   * only when the message carries a form). Sent back as-is on the form
+   * submit; the server reads campaign, variant and form from it. Opaque, and
+   * it lives 24 hours - every sync brings a fresh one.
+   */
+  formToken?: string;
   /** 'journey' when queued by a canvas node; absent for campaign in-apps. */
   source?: string;
   /**
@@ -975,6 +987,12 @@ export class InAppMessagingManager {
     } catch {
       return;
     }
+    // D383: a refused storefront identity token - refreshed or dropped, so
+    // the next sync / track carries a good one or none (no inline retry here).
+    if (this.auth.isStorefrontIdentityError?.(response.status, data)) {
+      await this.auth.handleStorefrontIdentityError?.(data).catch(() => false);
+      return;
+    }
     if (!this.auth.isSdkAuthError(response.status, data)) {
       return;
     }
@@ -1023,7 +1041,7 @@ export class InAppMessagingManager {
         headers: {
           'Content-Type': 'application/json',
           'X-SDK-Key': this.sdkKey,
-          ...(this.auth?.getSdkAuthHeaders(subjectUser) || {}),
+          ...(this.auth?.getSdkAuthHeaders(subjectUser, subjectUser ? null : this.identity.getAnonymousId()) || {}),
         },
         body: JSON.stringify({
           ...this.subject(),
@@ -1217,7 +1235,7 @@ export class InAppMessagingManager {
         headers: {
           'Content-Type': 'application/json',
           'X-SDK-Key': this.sdkKey,
-          ...(this.auth?.getSdkAuthHeaders(this.identity.getUserId()) || {}),
+          ...(this.auth?.getSdkAuthHeaders(this.identity.getUserId(), this.identity.getUserId() ? null : this.identity.getAnonymousId()) || {}),
         },
         body: JSON.stringify({
           ...this.subject(),
@@ -2400,22 +2418,33 @@ export class InAppMessagingManager {
     const timeoutId = setTimeout(() => controller.abort(), this.runtime.requestTimeoutMs);
     const subjectUser = this.identity.getUserId();
     try {
-      const response = await fetch(`${this.apiEndpoint}/v1/in-app/form-submit`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'X-SDK-Key': this.sdkKey,
-          ...(this.auth?.getSdkAuthHeaders(subjectUser) || {}),
-        },
-        body: JSON.stringify({
-          campaignId,
-          variantId: (message?.campaign as any)?.variantId,
-          userId: this.identity.getUserId() || undefined,
-          anonymousId: this.identity.getAnonymousId(),
-          values,
-        }),
-        signal: controller.signal,
-      });
+      const send = () =>
+        fetch(`${this.apiEndpoint}/v1/in-app/form-submit`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-SDK-Key': this.sdkKey,
+            ...(this.auth?.getSdkAuthHeaders(subjectUser, subjectUser ? null : this.identity.getAnonymousId()) || {}),
+          },
+          body: JSON.stringify({
+            campaignId,
+            variantId: (message?.campaign as any)?.variantId,
+            userId: this.identity.getUserId() || undefined,
+            anonymousId: this.identity.getAnonymousId(),
+            ...(message?.campaign?.formToken ? { formToken: message.campaign.formToken } : {}),
+            values,
+          }),
+          signal: controller.signal,
+        });
+      let response = await send();
+      // D383: a person's form is not lost to a refused storefront token - it
+      // is refreshed (expired) or dropped, and the form is sent once more.
+      if (response.status === 401 && this.auth?.isStorefrontIdentityError) {
+        const data = await response.clone().json().catch(() => null);
+        if (this.auth.isStorefrontIdentityError(401, data) && (await this.auth.handleStorefrontIdentityError?.(data).catch(() => false))) {
+          response = await send();
+        }
+      }
       await this.maybeHandleSdkAuthError(response, `${this.apiEndpoint}/v1/in-app/form-submit`, subjectUser);
       const json = await response.json().catch(() => null);
       if (!json || typeof json !== 'object') return { ok: false, message: 'Something went wrong. Please try again.' };
@@ -2502,7 +2531,7 @@ export class InAppMessagingManager {
         headers: {
           'Content-Type': 'application/json',
           'X-SDK-Key': this.sdkKey,
-          ...(this.auth?.getSdkAuthHeaders(subjectUser) || {}),
+          ...(this.auth?.getSdkAuthHeaders(subjectUser, subjectUser ? null : data.anonymousId ?? null) || {}),
         },
         body: JSON.stringify(data),
         signal: controller.signal,

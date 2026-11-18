@@ -85,14 +85,15 @@ export class IdentityManager {
   }
 
   /**
-   * Reset identity (logout)
+   * Reset identity (logout). `anonymousId`: the id to adopt instead of a new
+   * random one (resetTo, already validated by the caller).
    */
-  reset(): void {
+  reset(anonymousId?: string): void {
     this.logger.debug(`Resetting identity (was: ${this.userId || 'anonymous'})`);
 
     this.userId = null;
     this.attributes = {};
-    this.anonymousId = generateUUID();
+    this.anonymousId = anonymousId || generateUUID();
 
     this.storage.remove(USER_ID_KEY);
     this.storage.remove(USER_ATTRIBUTES_KEY);

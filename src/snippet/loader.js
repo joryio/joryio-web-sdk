@@ -7,7 +7,7 @@
  *
  * Usage:
  * <script>
- *   !function(){var e=window.joryio=window.joryio||[];if(!e.initialize)if(e.invoked)window.console&&console.error&&console.error("Joryio snippet included twice.");else{e.invoked=!0,e.methods=["init","track","identify","addAlias","setAttributes","setAttribute","incrementAttribute","unsetAttribute","addToArray","removeFromArray","reset","flush","optOut","optIn","updateConsent","getTrackingConsent","isUserOptedOut","setSdkAuthenticationToken","setSdkAuthenticationErrorCallback","getAnonymousId","getUserId","ready","getIdentity","getSessionInfo","getUTMData","updateUTM","syncInAppCampaigns","getInAppCampaigns","displayInAppCampaign","dismissInAppMessage","trackInAppConversion","ecommerce","wipeData","destroy"],e.keep=["init","optOut","optIn","updateConsent","wipeData"],e.factory=function(t){return function(){var n=Array.prototype.slice.call(arguments);if(n.unshift(t),e.length>=1e3)for(var i=0;i<e.length;i++)if(e.keep.indexOf(e[i][0])<0){e.splice(i,1);break}return e.push(n),/^(get|is)[A-Z]/.test(t)?void 0:e}};for(var t=0;t<e.methods.length;t++){var n=e.methods[t];e[n]=e.factory(n)}e.load=function(e){var t=document.createElement("script");t.type="text/javascript",t.async=!0,t.src="https://sdk.joryio.com/web/1/joryio.min.js";var n=document.getElementsByTagName("script")[0];n.parentNode.insertBefore(t,n)},e.load()}}();
+ *   !function(){var e=window.joryio=window.joryio||[];if(!e.initialize)if(e.invoked)window.console&&console.error&&console.error("Joryio snippet included twice.");else{e.invoked=!0,e.methods=["init","track","identify","identifyFromLink","addAlias","setAttributes","setAttribute","incrementAttribute","unsetAttribute","addToArray","removeFromArray","reset","resetTo","flush","optOut","optIn","updateConsent","getTrackingConsent","isUserOptedOut","setSdkAuthenticationToken","setSdkAuthenticationErrorCallback","setStorefrontIdentityToken","setStorefrontIdentityTokenProvider","getAnonymousId","getUserId","ready","getIdentity","getSessionInfo","getUTMData","updateUTM","syncInAppCampaigns","getInAppCampaigns","displayInAppCampaign","dismissInAppMessage","trackInAppConversion","ecommerce","wipeData","destroy"],e.keep=["init","optOut","optIn","updateConsent","wipeData"],e.factory=function(t){return function(){var n=Array.prototype.slice.call(arguments);if(n.unshift(t),e.length>=1e3)for(var i=0;i<e.length;i++)if(e.keep.indexOf(e[i][0])<0){e.splice(i,1);break}return e.push(n),/^(get|is)[A-Z]/.test(t)?void 0:e}};for(var t=0;t<e.methods.length;t++){var n=e.methods[t];e[n]=e.factory(n)}e.load=function(e){var t=document.createElement("script");t.type="text/javascript",t.async=!0,t.src="https://sdk.joryio.com/web/1/joryio.min.js";var n=document.getElementsByTagName("script")[0];n.parentNode.insertBefore(t,n)},e.load()}}();
  *   joryio.init({ sdkKey: 'YOUR_SDK_KEY' });
  * </script>
  *
@@ -49,6 +49,7 @@
         'init',
         'track',
         'identify',
+        'identifyFromLink',
         'addAlias',
         'setAttributes',
         'setAttribute',
@@ -57,6 +58,7 @@
         'addToArray',
         'removeFromArray',
         'reset',
+        'resetTo',
         'flush',
         'optOut',
         'optIn',
@@ -65,6 +67,8 @@
         'isUserOptedOut',
         'setSdkAuthenticationToken',
         'setSdkAuthenticationErrorCallback',
+        'setStorefrontIdentityToken',
+        'setStorefrontIdentityTokenProvider',
         'getAnonymousId',
         'getUserId',
         'ready',

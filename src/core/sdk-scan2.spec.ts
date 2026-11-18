@@ -263,7 +263,7 @@ describe('consent pending keeps writes across a reload (scan 2 #5)', () => {
 
   it('push_permission is marked reported only once the server acknowledged it', async () => {
     calls = installFetch((req) => (req.path === '/api/v1/attributes' ? { status: 503, body: {} } : ok(req)));
-    sdk = new JoryioSDK({ ...BASE_CONFIG, trackSessionStart: false });
+    sdk = new JoryioSDK({ ...BASE_CONFIG, trackSessionStart: false, webPush: true });
     await waitFor(() => calls.some((c) => c.path === '/api/v1/attributes'));
     await sdk.destroy();
     sdk = null;
@@ -271,7 +271,7 @@ describe('consent pending keeps writes across a reload (scan 2 #5)', () => {
     // Next page view: the API works again. The permission was never stored, so
     // it must be reported now - the marker used to be written before the send.
     calls = installFetch(ok);
-    sdk = new JoryioSDK({ ...BASE_CONFIG, trackSessionStart: false });
+    sdk = new JoryioSDK({ ...BASE_CONFIG, trackSessionStart: false, webPush: true });
     await waitFor(() =>
       calls.some((c) => c.path === '/api/v1/attributes' && c.body.attributes?.push_permission === 'unavailable'),
     );
@@ -281,7 +281,7 @@ describe('consent pending keeps writes across a reload (scan 2 #5)', () => {
 
     // ...and after the acknowledgement, not again.
     calls = installFetch(ok);
-    sdk = new JoryioSDK({ ...BASE_CONFIG, trackSessionStart: false });
+    sdk = new JoryioSDK({ ...BASE_CONFIG, trackSessionStart: false, webPush: true });
     await settle(900);
     expect(calls.some((c) => c.path === '/api/v1/attributes')).toBe(false);
   });

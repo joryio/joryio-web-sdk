@@ -13,6 +13,7 @@ import {
   NetworkResponse,
   AttributeOps,
   SdkAuthFailureCallback,
+  StorefrontIdentityTokenProvider,
   utf8Length,
 } from './network';
 import { UTMManager } from './utm';
@@ -32,6 +33,8 @@ import {
 } from './write-retry';
 import { WriteOutbox, OutboxEntry, OUTBOX_KEY } from './outbox';
 import { valueProblem, withoutUnsendableValues } from './values';
+import { resetToRefusal, rememberSignedInAnonymousId, SIGNED_IN_ANONYMOUS_IDS_KEY } from './reset-to';
+import { consumeClickIdentityTokenFromLocation, readClickIdentityToken, withoutClickIdentityToken } from './click-identity';
 
 /**
  * The visitor's own opt-out, persisted so it survives a reload. It used to
@@ -290,6 +293,15 @@ export class JoryioSDK {
   private pruneTimer: ReturnType<typeof setTimeout> | null = null;
 
   /**
+   * Click-link identity (D407): a tracked link's `jr_t`, held IN MEMORY ONLY
+   * until it may be sent (consent pending) - never persisted, dropped on an
+   * opt-out, a denial or a reset. See click-identity.ts.
+   */
+  private pendingLinkToken: string | null = null;
+  /** Tokens already handed to the server by this page (send once). */
+  private readonly sentLinkTokens = new Set<string>();
+
+  /**
    * @param preInit - internal: privacy decisions queued before the SDK loaded
    *   (see installSnippetQueue). Not part of the public API.
    */
@@ -349,6 +361,13 @@ export class JoryioSDK {
     this.userOptedOut = this.config.optOut || this.storedOptOut();
     if (this.userOptedOut) this.optedOutAt = this.storedStamp(OPT_OUT_AT_KEY);
     this.trackingConsent = this.initialConsent(this.config.trackingConsent);
+
+    // Click-link identity (D407): take `jr_t` off the address bar FIRST - before
+    // the UTM manager records the landing page - so the token is never
+    // bookmarked, shared, or stored as a landing URL. Stripped whatever the
+    // privacy state (hygiene, not collection); used only when allowed.
+    const linkToken = consumeClickIdentityTokenFromLocation();
+    if (linkToken && !this.disabled) this.pendingLinkToken = linkToken;
 
     // Initialize UTM tracking (before session to check for campaign changes)
     this.utm = new UTMManager(
@@ -434,6 +453,16 @@ export class JoryioSDK {
       if (this.config.sdkAuthenticationToken) {
         this.network.setSdkAuthenticationToken(this.config.sdkAuthenticationToken);
       }
+    }
+
+    // Storefront identity token (D383): bound to the visitor id it was minted
+    // for, read live from identity so a reset() (new visitor) never sends it.
+    this.network.setAnonymousIdSource(() => this.identity.getAnonymousId());
+    if (this.config.storefrontIdentityTokenProvider) {
+      this.network.setStorefrontIdentityTokenProvider(this.config.storefrontIdentityTokenProvider);
+    }
+    if (this.config.storefrontIdentityToken) {
+      this.network.setStorefrontIdentityToken(this.config.storefrontIdentityToken);
     }
 
     this.outbox = this.createOutbox();
@@ -528,6 +557,8 @@ export class JoryioSDK {
         getDeviceId: () => this.deviceId,
         // The new permission is reported now, not on the next page load.
         onSubscribeSettled: () => this.reportPushPermissionIfChanged(),
+        // A primer is about to ask: the site uses web push, so report now.
+        onPrepared: () => this.reportPushPermissionIfChanged(),
       },
     );
 
@@ -614,7 +645,8 @@ export class JoryioSDK {
     if (!this.disabled) JoryioSDK.instance = this;
     this.logger.info('SDK initialized successfully');
 
-    // Report permission state now the SDK is live. Only sends on a change.
+    // Report permission state now the SDK is live - only when this site uses
+    // web push (see pushPermissionReported), and only on a change.
     this.reportPushPermissionIfChanged();
 
     // Enqueue Session Start BEFORE starting the queue auto-flush timer.
@@ -694,6 +726,10 @@ export class JoryioSDK {
     // An identify() made while tracking was off on an earlier page view, now
     // that it is allowed (D-b).
     if (!this.isOptedOut) this.releaseDeferredIdentify();
+
+    // A tracked link's `jr_t` (D407): now if tracking is allowed, at the
+    // grant if consent is pending, never if it is off.
+    this.flushLinkIdentity();
 
     // The opt-out marker, if the switch changed since the server last heard
     // (an `optOut: true` in the config or a pre-init optOut() included).
@@ -1337,6 +1373,8 @@ export class JoryioSDK {
       this.outbox.discardNonWithdrawals();
       this.outbox.kick();
       if (this.config.inApp.enabled) this.inapp.stop();
+      // A tracked link's token is never sent after a refusal.
+      this.pendingLinkToken = null;
       return;
     }
 
@@ -1370,6 +1408,67 @@ export class JoryioSDK {
       });
     }
     this._push.syncExistingSubscription().catch(() => undefined);
+    // A tracked link's token held while consent was pending (D407).
+    this.flushLinkIdentity();
+  }
+
+  /**
+   * Recognise the person who clicked a message (D407): send a tracked link's
+   * `jr_t` to POST /v1/identify-link, so this anonymous visit is the
+   * recipient's. Only when tracking is allowed (consent granted, not opted
+   * out, Do Not Track respected) and nobody is identified here: an
+   * identify()-ed user or a signed-in store customer (storefront identity
+   * token) always wins over a link - the server enforces the same and also
+   * keeps a browser that is already someone else as that person. Consent
+   * pending: held in memory and sent at the grant. Each token once per page.
+   */
+  private flushLinkIdentity(): void {
+    const token = this.pendingLinkToken;
+    if (!token) return;
+    if (this.disabled || this.isOptedOut) {
+      this.pendingLinkToken = null;
+      return;
+    }
+    if (!this.canSend()) return; // consent pending / ingestion paused: keep it for the grant
+    this.pendingLinkToken = null;
+    if (this.sentLinkTokens.has(token)) return;
+    if (this.effectiveUserId()) {
+      this.logger.debug('Link identity not sent: a user is identified on this browser');
+      return;
+    }
+    if (this.network.hasStorefrontIdentity()) {
+      this.logger.debug('Link identity not sent: a signed-in store customer is on this browser');
+      return;
+    }
+    this.sentLinkTokens.add(token);
+    this.network
+      .sendIdentifyLink(this.config.apiEndpoint, { token, anonymousId: this.identity.getAnonymousId() })
+      .catch((error) => this.logger.debug('Link identity request failed:', error));
+  }
+
+  /**
+   * Recognise the person who clicked a tracked link, for a page that handles
+   * URLs itself (a single-page app's router, a link opened in a webview).
+   * Reads `jr_t` from `url`; when `url` is the address bar's, also removes
+   * the token from it. The same rules as on page load: only when tracking
+   * is allowed and nobody is identified here. Does nothing without `jr_t`.
+   */
+  identifyFromLink(url: string): void {
+    if (!this.isInitialized || this.disabled) return;
+    const token = readClickIdentityToken(url);
+    if (!token) return;
+    try {
+      if (typeof window !== 'undefined' && window.location && readClickIdentityToken(window.location.href) === token) {
+        const stripped = withoutClickIdentityToken(window.location.href);
+        if (stripped && window.history && typeof window.history.replaceState === 'function') {
+          window.history.replaceState(window.history.state, '', stripped);
+        }
+      }
+    } catch {
+      // Hygiene only.
+    }
+    this.pendingLinkToken = token;
+    this.flushLinkIdentity();
   }
 
   /** Send the attribute and profile writes held while consent was pending. */
@@ -1998,9 +2097,15 @@ export class JoryioSDK {
    *
    * Change-detection matters: attributes are not deduplicated server-side, so
    * reporting unconditionally would spend a request on every page load.
+   *
+   * And only when this site uses web push (pushPermissionReported): on a site
+   * that does not, the value says nothing anyone can act on, and writing it
+   * cost a request per new visitor - and, for an anonymous visitor the SDK
+   * sends nothing else for, created a profile of its own.
    */
   private reportPushPermissionIfChanged(): void {
     if (!this.isInitialized || this.isOptedOut) return;
+    if (!this.pushPermissionReported()) return;
     try {
       const state = this._push.getPermissionState();
       const current = state === 'notDetermined' ? 'not_determined' : state;
@@ -2014,6 +2119,23 @@ export class JoryioSDK {
     } catch (error) {
       this.logger.warn('Could not report push permission:', error);
     }
+  }
+
+  /**
+   * Does this SDK instance use web push, so `push_permission` is reported?
+   *
+   * - `webPush: true` in the init config: yes.
+   * - subscribe() was called, or prepare() succeeded, on this page: yes, even
+   *   with `webPush: false` - the page asked for push, and the answer counts.
+   * - `webPush: false`: no.
+   * - unset: yes once this browser has used Joryio web push (an earlier
+   *   subscribe() / prepare(), or a registration from an earlier version).
+   */
+  private pushPermissionReported(): boolean {
+    if (this.config.webPush === true) return true;
+    if (this._push.usedOnThisPage()) return true;
+    if (this.config.webPush === false) return false;
+    return this._push.usedEarlier();
   }
 
   /**
@@ -2153,12 +2275,66 @@ export class JoryioSDK {
    * on a shared device.
    */
   async reset(): Promise<void> {
+    return this.resetIdentity(undefined);
+  }
+
+  /**
+   * reset(), then adopt `anonymousId` instead of a new random id (BACKLOG
+   * D366). For a host that keeps its own visitor id - a store tracker, a
+   * site's own analytics id - so the SDK and the host stay ONE visitor after
+   * a logout, without a random id in between.
+   *
+   * Everything reset() does happens: the user id, attributes, in-app state,
+   * the SDK-authentication and storefront tokens and the session are
+   * forgotten, and the push subscription moves to the new visitor. The id
+   * must be 8 to 255 letters, digits, `.`, `_`, `:` or `-`, must not have the
+   * shape of a Joryio profile id (24 lowercase hex) and must not be the user
+   * id this SDK holds, nor the anonymous id it holds while a user is signed
+   * in (that id is tied to the signed-in user's profile); a refused id is
+   * logged and the call is a plain reset() - a random id - so a logout is
+   * never skipped.
+   *
+   * Resolves `true` when the id was adopted, `false` when it was refused (a
+   * random id was used instead) or the SDK is not initialized (nothing done).
+   *
+   * An anonymous id is a claim, not a credential: whoever holds an anonymous
+   * id that is already tied to an identified profile is treated as that
+   * visitor (in-app messages, events, push), unless SDK Authentication is on
+   * - then anonymous writes to an identified profile are refused (403). Adopt
+   * only ids your own app issued for this browser.
+   */
+  async resetTo(anonymousId: string): Promise<boolean> {
+    if (!this.isInitialized) {
+      this.logger.error('SDK not initialized');
+      return false;
+    }
+    const userId = this.identity.getUserId();
+    const refusal = resetToRefusal(
+      anonymousId,
+      [userId, this.withdrawalUserId],
+      userId ? this.identity.getAnonymousId() : null,
+      this.signedInAnonymousIds(),
+    );
+    if (refusal) this.logger.error(`${refusal}; a random anonymous id is used instead`);
+    await this.resetIdentity(refusal ? undefined : anonymousId);
+    return !refusal;
+  }
+
+  /** Anonymous ids tied to a signed-in user when a reset signed them out (D366). */
+  private signedInAnonymousIds(): string[] {
+    const stored = this.storage.get<unknown>(SIGNED_IN_ANONYMOUS_IDS_KEY);
+    return Array.isArray(stored) ? stored.filter((x): x is string => typeof x === 'string') : [];
+  }
+
+  private async resetIdentity(anonymousId: string | undefined): Promise<void> {
     if (!this.isInitialized) {
       this.logger.error('SDK not initialized');
       return;
     }
 
     this.logger.info('Resetting user identity');
+    // A link token held for the outgoing visitor is not the next one's (D407).
+    this.pendingLinkToken = null;
 
     // --- Synchronous: everything that decides WHO the next call is about ---
 
@@ -2183,12 +2359,22 @@ export class JoryioSDK {
     // Leftovers refused with a 401 anyway are dropped, never reported to the
     // host's handler.
     this.network.retireSdkAuthToken();
+    // The store customer's storefront identity token is theirs and this
+    // visitor's (D383): the next visitor never carries it. (It is bound to the
+    // old anonymous id anyway; dropped so it is not even held.)
+    this.network.clearStorefrontIdentityToken();
     // A user kept only for withdrawals (D-b) is logged out too.
     this.forgetDeferredIdentify();
 
+    // The outgoing user's anonymous id is tied to their profile: a later
+    // resetTo() must never hand it to someone else (D366).
+    if (this.identity.getUserId()) {
+      this.storage.set(SIGNED_IN_ANONYMOUS_IDS_KEY, rememberSignedInAnonymousId(this.signedInAnonymousIds(), this.identity.getAnonymousId()));
+    }
+
     // New anonymous id, no user id.
     this.pinAnonymousWrites();
-    this.identity.reset();
+    this.identity.reset(anonymousId);
     this.network.setCurrentUserId(this.identity.getUserId());
 
     // UTM before the session: the new session's Session Start (tracked by the
@@ -2230,6 +2416,7 @@ export class JoryioSDK {
       return;
     }
     this.logger.info('Wiping local SDK data');
+    this.pendingLinkToken = null;
 
     // Push first, while the outgoing ids are still current (it captures them).
     const pushWiped = this._push.forget().catch(() => undefined);
@@ -2257,6 +2444,9 @@ export class JoryioSDK {
     // under the ids they were made with (contract item 36).
     this.outbox.discardNonWithdrawals();
     this.storage.remove(REPORTED_PUSH_PERMISSION_KEY);
+    // Local data like any other (D366): resetTo's memory of signed-in users'
+    // anonymous ids goes with the wipe, the same on all five SDKs.
+    this.storage.remove(SIGNED_IN_ANONYMOUS_IDS_KEY);
     // "No Session Start queued for any session yet" - NOT the absence of the
     // marker, which reads as "sent" (rule 75): a wipe while tracking was off,
     // then a reload and a grant, resumed the post-wipe session with no
@@ -2288,6 +2478,7 @@ export class JoryioSDK {
     for (const key of [OUTBOX_KEY, PENDING_UNREGISTER_KEY]) collectUserIds(this.storage.get<unknown>(key), keepTokens);
     this.network.retireSdkAuthToken();
     this.network.dropStandbySdkAuthTokens(keepTokens);
+    this.network.clearStorefrontIdentityToken();
     this.forgetDeferredIdentify();
     this.pinAnonymousWrites();
     this.identity.reset();
@@ -2769,6 +2960,32 @@ export class JoryioSDK {
       return;
     }
     this.network.setSdkAuthenticationToken(token);
+  }
+
+  /**
+   * Storefront identity token (store plugins) - set or replace the token
+   * Joryio minted for a signed-in store customer's browser (null forgets it).
+   * Sent only on anonymous requests of the visitor it was minted for. See
+   * the `storefrontIdentityToken` init option.
+   */
+  setStorefrontIdentityToken(token: string | null): void {
+    if (!this.isInitialized) {
+      this.logger?.error('SDK not initialized');
+      return;
+    }
+    this.network.setStorefrontIdentityToken(token);
+  }
+
+  /**
+   * Storefront identity token - register the function asked for a fresh token
+   * (before the held one expires, or when the API refused it as expired).
+   */
+  setStorefrontIdentityTokenProvider(provider: StorefrontIdentityTokenProvider | null): void {
+    if (!this.isInitialized) {
+      this.logger?.error('SDK not initialized');
+      return;
+    }
+    this.network.setStorefrontIdentityTokenProvider(provider);
   }
 
   /**

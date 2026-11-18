@@ -31,6 +31,13 @@ const REGISTRATION_MARKER_KEY = 'push_registration';
  */
 const UNREGISTERED_KEY = 'push_unregistered';
 /**
+ * Set when this browser first uses Joryio web push (subscribe() called, or
+ * prepare() succeeded). With `webPush` unset in the init config, it is what
+ * makes the SDK report `push_permission` on later page loads - including a
+ * revocation made in the browser's settings.
+ */
+const IN_USE_KEY = 'push_in_use';
+/**
  * Server-side unregisters not acknowledged yet. A WITHDRAWAL (contract item
  * 36): sent even while opted out, with consent denied or pending, and after
  * wipeData(); retried by the one rule of write-retry.ts. A list (an earlier
@@ -82,6 +89,11 @@ export interface PushManagerOptions {
    * page load.
    */
   onSubscribeSettled?: () => void;
+  /**
+   * Called when prepare() succeeds: the workspace has web push on and the
+   * service worker is registered, so this site uses web push.
+   */
+  onPrepared?: () => void;
 }
 
 export interface PushSubscribeOptions {
@@ -122,6 +134,8 @@ export class PushManager {
   private unregisterTimer: ReturnType<typeof setTimeout> | null = null;
   private readonly getDeviceId: () => string | undefined;
   private readonly onSubscribeSettled: (() => void) | null;
+  private readonly onPrepared: (() => void) | null;
+  private usedThisPage = false;
 
   constructor(
     private readonly logger: Logger,
@@ -136,6 +150,39 @@ export class PushManager {
     this.storage = options.storage || null;
     this.getDeviceId = options.getDeviceId || (() => undefined);
     this.onSubscribeSettled = options.onSubscribeSettled || null;
+    this.onPrepared = options.onPrepared || null;
+  }
+
+  /** subscribe() was called, or prepare() succeeded, on this page. */
+  usedOnThisPage(): boolean {
+    return this.usedThisPage;
+  }
+
+  /**
+   * This browser used Joryio web push on an earlier page view: the marker
+   * set by subscribe() / prepare(), or the state an earlier SDK version left
+   * (a registration, or an unsubscribe), which predates the marker.
+   */
+  usedEarlier(): boolean {
+    if (!this.storage) return false;
+    try {
+      return (
+        this.storage.get<boolean>(IN_USE_KEY) === true ||
+        this.storage.get(REGISTRATION_MARKER_KEY) != null ||
+        this.storage.get<boolean>(UNREGISTERED_KEY) === true
+      );
+    } catch {
+      return false;
+    }
+  }
+
+  private markUsed(): void {
+    this.usedThisPage = true;
+    try {
+      this.storage?.set(IN_USE_KEY, true);
+    } catch {
+      // Storage refused: this page still knows (usedThisPage).
+    }
   }
 
   /**
@@ -290,6 +337,12 @@ export class PushManager {
       await navigator.serviceWorker.ready;
       this.prepared = { registration, publicKey };
       this.lastPrepareError = null;
+      this.markUsed();
+      try {
+        this.onPrepared?.();
+      } catch (error) {
+        this.logger.warn('Push permission report failed:', error);
+      }
       return true;
     } catch (err) {
       this.lastPrepareError = 'sw-failed';
@@ -311,6 +364,7 @@ export class PushManager {
     try {
       return await this.subscribeOnce(options);
     } finally {
+      this.markUsed();
       try {
         this.onSubscribeSettled?.();
       } catch (error) {

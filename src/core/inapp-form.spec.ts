@@ -140,6 +140,23 @@ describe('in-app message forms (drag & drop Signup form block)', () => {
     expect(submitForm).not.toHaveBeenCalled();
   });
 
+  it('the form token served with the message goes back with the submit, unchanged (D371 item 4)', async () => {
+    (globalThis as any).window = {};
+    try {
+      const m = make();
+      (m as any).installHostBridge();
+      (m as any).runtime = { canSend: () => true, requestTimeoutMs: 5000 };
+      const calls = installFetch(() => ({ status: 200, body: { ok: true } }));
+      (m as any).displayedMessages.set('camp-1', { campaign: { id: 'camp-1', variantId: 'v2', formToken: 'opaque.form.token' } });
+      await (globalThis as any).window.__joryioInApp.submitForm('camp-1', { email: 'ada@example.com' });
+      const post = calls.find((c) => c.path === '/v1/in-app/form-submit')!;
+      expect(post.body).toMatchObject({ campaignId: 'camp-1', variantId: 'v2', anonymousId: 'anon-1', formToken: 'opaque.form.token' });
+    } finally {
+      delete (globalThis as any).window;
+      delete (globalThis as any).fetch;
+    }
+  });
+
   it('the host bridge posts a displayed message\'s values to /v1/in-app/form-submit with the SDK identity', async () => {
     (globalThis as any).window = {};
     try {
@@ -159,6 +176,8 @@ describe('in-app message forms (drag & drop Signup form block)', () => {
         anonymousId: 'anon-1',
         values: { email: 'ada@example.com', marketing: ['yes'] },
       });
+      // No form token served (an older server): none sent.
+      expect(post.body.formToken).toBeUndefined();
       // A message that is not on screen cannot submit.
       const closed = await (globalThis as any).window.__joryioInApp.submitForm('camp-gone', { email: 'x' });
       expect(closed.ok).toBe(false);

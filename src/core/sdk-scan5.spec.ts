@@ -689,7 +689,7 @@ describe('NICE fixes', () => {
 
   it('N9: push_permission is reported right after push.subscribe() settles', async () => {
     const calls = installFetch();
-    const sdk = new JoryioSDK({ ...BASE_CONFIG, trackSessionStart: false } as any);
+    const sdk = new JoryioSDK({ ...BASE_CONFIG, trackSessionStart: false, webPush: true } as any);
     await waitFor(() => calls.some((c) => c.path.endsWith('/v1/attributes')));
     const before = calls.length;
     jest.spyOn((sdk as any)._push, 'getPermissionState').mockReturnValue('granted');

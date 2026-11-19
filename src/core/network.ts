@@ -1320,8 +1320,8 @@ export class NetworkClient {
 
   /**
    * Click-link identity (D407): hand a tracked link's `jr_t` to the server,
-   * which attaches this anonymous visitor to the message's recipient when
-   * the token verifies. Anonymous by construction (no subject user); the
+   * which attributes this anonymous visitor's events to the message's
+   * recipient when the token verifies (attribution only - never a merge). Anonymous by construction (no subject user); the
    * answer is only `{ success, status: 'ok' | 'ignored' }`.
    */
   async sendIdentifyLink(apiEndpoint: string, payload: { token: string; anonymousId: string }): Promise<NetworkResponse> {

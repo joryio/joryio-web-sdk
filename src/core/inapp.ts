@@ -3,10 +3,22 @@
  * Handles in-app message campaigns, display, and tracking
  */
 
+import {
+  hasPageTargeting,
+  isPageTrigger,
+  PAGE_CONTEXT_CAPABILITY,
+  pageTargetingMatches,
+  pageTriggerMet,
+  type PageContextTracker,
+  type PageSignal,
+  type PageTargeting,
+} from './page-context';
 import { Logger } from '../utils/logger';
 import type { InAppDisplayOptions } from './config';
+import { sdkIdentityHeaders } from './config';
 import { IdentityManager } from './identity';
 import { SessionManager } from './session';
+import type { LinkRouter } from './links';
 import { StorageManager } from './storage';
 import { SdkAuthFailureInfo } from './network';
 
@@ -142,6 +154,12 @@ export interface InAppCampaign {
    */
   reevaluateBeforeDisplay?: boolean;
   watchedAttributes?: string[];
+  /**
+   * The pages it may show on (D444 Phase 4, page-context.ts). Checked on THIS
+   * device before every display and on every route change; the server sends
+   * such a campaign only to an SDK that declares `page_context`.
+   */
+  pageTargeting?: PageTargeting;
 }
 
 export interface InAppTrigger {
@@ -157,7 +175,12 @@ export interface InAppTrigger {
     | 'event'
     | 'attribute_change'
     | 'attribute_threshold'
-    | 'push_notification_tap';
+    | 'push_notification_tap'
+    // Page triggers (D444 Phase 4, page-context.ts): fired by this SDK only.
+    | 'page_view'
+    | 'exit_intent'
+    | 'scroll_depth'
+    | 'time_on_page';
   event?: string;
   attribute?: string;
   operator?: string;
@@ -417,6 +440,8 @@ export function cssValue(raw: unknown): string | null {
 }
 
 export class InAppMessagingManager {
+  /** The SDK's link router (`setLinkHandler`); set by the SDK after construction. */
+  links: LinkRouter | null = null;
   /** Messages waiting out a display delay, so they can be cancelled. */
   private pendingDelays = new Map<string, ReturnType<typeof setTimeout>>();
 
@@ -505,9 +530,54 @@ export class InAppMessagingManager {
    * needs to be told before someone publishes into silence.
    */
   private capabilities(): string[] {
-    const caps = ['content.native'];
+    // `placements` + `content.data`: this build draws placements and hands
+    // their data to the app (placements.ts) - the same words every SDK sends.
+    const caps = ['content.native', 'placements', 'content.data'];
     if (this.allowHtmlJsInAppMessages) caps.push('content.html');
+    // `page_context`: this build checks a campaign's page rules and fires page triggers.
+    if (this.page) caps.push(PAGE_CONTEXT_CAPABILITY);
     return caps;
+  }
+
+  private page: PageContextTracker | null = null;
+  private pageUnsubscribe: (() => void) | null = null;
+  /** Campaigns a page trigger already fired on THIS page (cleared on a route change). */
+  private pageFired = new Set<string>();
+
+  /**
+   * Page context (D444 Phase 4): page rules are checked before every display,
+   * page triggers fire held campaigns, and a route change re-checks the
+   * campaigns that wait for a page.
+   */
+  setPageContext(tracker: PageContextTracker | null): void {
+    this.pageUnsubscribe?.();
+    this.pageUnsubscribe = null;
+    this.page = tracker;
+    if (tracker) this.pageUnsubscribe = tracker.onSignal((signal) => this.onPageSignal(signal));
+  }
+
+  /** Whether the current page allows this campaign. No rules = yes; rules and no page tracker = no. */
+  private pageAllows(campaign: InAppCampaign): boolean {
+    if (!hasPageTargeting(campaign.pageTargeting)) return true;
+    return !!this.page && pageTargetingMatches(campaign.pageTargeting, this.page.current());
+  }
+
+  private onPageSignal(signal: PageSignal): void {
+    if (!this.page) return;
+    if (signal.type === 'page_change') this.pageFired.clear();
+    const progress = this.page.progress();
+    for (const campaign of this.campaigns.values()) {
+      const triggers = campaign.triggers || [];
+      const pageTrigger = triggers.find((t) => isPageTrigger(t) && pageTriggerMet(t, signal, progress));
+      // A campaign that shows "immediately" but only on some pages shows on
+      // arriving at one of them.
+      const arrives = signal.type === 'page_change' && hasPageTargeting(campaign.pageTargeting) && triggers.some((t) => t.type === 'immediate');
+      if (!pageTrigger && !arrives) continue;
+      if (this.pageFired.has(campaign.id)) continue;
+      if (!this.pageAllows(campaign)) continue;
+      this.pageFired.add(campaign.id);
+      this.displayCampaign(campaign).catch((error) => this.logger.error('In-app display failed:', error));
+    }
   }
 
   /**
@@ -843,11 +913,23 @@ export class InAppMessagingManager {
         // the TOP origin). Rejects javascript:/data:/mailto:/tel: and protocol-
         // relative `//host` (open-redirect) — those aren't routed here.
         if (!/^(https?:\/\/|\/(?!\/))/i.test(url)) return;
-        if (target === '_top' || target === '_self') {
-          if (window.top) window.top.location.href = url;
-        } else {
-          window.open(url, '_blank', 'noopener');
+        const go = () => {
+          if (target === '_top' || target === '_self') {
+            if (window.top) window.top.location.href = url;
+          } else {
+            window.open(url, '_blank', 'noopener');
+          }
+        };
+        // The site-wide link handler (setLinkHandler) sees it first, a
+        // root-relative link resolved against the page.
+        if (!this.links) return go();
+        let absolute = url;
+        try {
+          absolute = new URL(url, window.location.href).href;
+        } catch {
+          // Unparseable: the handler gets it as written.
         }
+        this.links.route(absolute, 'in_app', { campaignId }, go);
       },
       closeMessage: (campaignId: string) => {
         if (!this.displayedMessages.has(campaignId)) return;
@@ -1041,6 +1123,7 @@ export class InAppMessagingManager {
         headers: {
           'Content-Type': 'application/json',
           'X-SDK-Key': this.sdkKey,
+          ...sdkIdentityHeaders(),
           ...(this.auth?.getSdkAuthHeaders(subjectUser, subjectUser ? null : this.identity.getAnonymousId()) || {}),
         },
         body: JSON.stringify({
@@ -1140,7 +1223,8 @@ export class InAppMessagingManager {
   private processImmediateTriggers(): void {
     for (const campaign of this.campaigns.values()) {
       const triggers = campaign.triggers || [];
-      const hasImmediateTrigger = triggers.some((t) => t.type === 'immediate');
+      // `page_view` (D444 Phase 4) counts the page the sync arrived on as viewed.
+      const hasImmediateTrigger = triggers.some((t) => t.type === 'immediate' || (t.type === 'page_view' && !!this.page));
       if (hasImmediateTrigger) {
         this.displayCampaign(campaign).catch((error) =>
           this.logger.error('In-app display failed:', error));
@@ -1190,31 +1274,9 @@ export class InAppMessagingManager {
    * typo look like it worked.
    */
   private triggerFilterMatches(trigger: InAppTrigger, properties?: Record<string, any>): boolean {
-    if (!trigger.attribute) return true;
-    const actual = properties?.[trigger.attribute];
-    const expected = trigger.value;
-    switch (trigger.operator) {
-      case undefined:
-      case 'equals':
-      case 'eq':
-        return actual === expected;
-      case 'not_equals':
-      case 'neq':
-        return actual !== expected;
-      case 'greater_than':
-      case 'gt':
-        return Number(actual) > Number(expected);
-      case 'less_than':
-      case 'lt':
-        return Number(actual) < Number(expected);
-      case 'contains':
-        return String(actual ?? '').includes(String(expected));
-      case 'exists':
-        return actual !== undefined && actual !== null;
-      default:
-        return false;
-    }
+    return inAppTriggerFilterMatches(trigger, properties);
   }
+
 
   /**
    * Fetch a re-check campaign's content, re-verifying eligibility server-side.
@@ -1235,6 +1297,7 @@ export class InAppMessagingManager {
         headers: {
           'Content-Type': 'application/json',
           'X-SDK-Key': this.sdkKey,
+          ...sdkIdentityHeaders(),
           ...(this.auth?.getSdkAuthHeaders(this.identity.getUserId(), this.identity.getUserId() ? null : this.identity.getAnonymousId()) || {}),
         },
         body: JSON.stringify({
@@ -1244,6 +1307,9 @@ export class InAppMessagingManager {
           userAttributes: this.identity.getAttributes(),
           pendingAttributes: this.identity.pending.pending(this.identity.getAnonymousId()),
           deviceType: 'web',
+          // The page decides on the server for a re-check (D444 Phase 4).
+          capabilities: this.capabilities(),
+          ...(this.page ? { context: this.page.current() } : {}),
         }),
         signal: controller.signal,
       });
@@ -1285,6 +1351,11 @@ export class InAppMessagingManager {
     // in one burst (an event fired twice, a re-sync's immediate trigger) both
     // passed it and the message appeared - and was counted - twice.
     const id = campaign.id;
+    // Page rules (D444 Phase 4): not on this page - nothing claimed, nothing counted.
+    if (!this.pageAllows(campaign)) {
+      this.logger.debug(`Campaign ${id} not for this page`);
+      return;
+    }
     if (this.claimed.has(id) || this.displayedMessages.has(id) || this.pendingDelays.has(id)) {
       this.logger.debug(`Campaign ${id} already displayed, scheduled or being prepared`);
       return;
@@ -1912,11 +1983,18 @@ export class InAppMessagingManager {
               // the wrong branch in the first place - and a stored `dismiss`
               // button that still carries a stale url would open it.
               (b.action === 'url' || b.action === 'deep_link') &&
-              b.url &&
-              /^https?:\/\//i.test(b.url)
+              b.url
             ) {
-              // http(s) only - same rule as every other renderer.
-              window.open(b.url, '_blank', 'noopener');
+              // http(s) opens - same rule as every other renderer - and an
+              // app deep link only reaches the site-wide link handler
+              // (setLinkHandler), which sees every link first. Anything else
+              // (javascript:, data:, ...) is refused before it.
+              const url = b.url;
+              const open = () => {
+                if (/^https?:\/\//i.test(url)) window.open(url, '_blank', 'noopener');
+              };
+              if (this.links) this.links.route(url, 'in_app', { campaignId: campaign.id }, open);
+              else open();
             }
             // EVERY button dismisses, and an unknown action was already decoded
             // to dismiss server-side, so a future action type cannot leave a
@@ -2173,123 +2251,7 @@ export class InAppMessagingManager {
     css: string,
     type: InAppCampaign['type'],
   ): string {
-    const cid = JSON.stringify(campaignId);
-    const key = JSON.stringify(HOST_BRIDGE_KEY);
-    // Content-sized types: the HOST picks the width (min(maxWidth, viewport -
-    // margin)) and only the height follows the content. The body used to be
-    // inline-block so its width could be measured and the frame set to it -
-    // which let the frame start narrow and stay narrow. Now the body is a
-    // normal block at the frame's width; flow-root keeps the first and last
-    // child's margins inside it, so its height is the content's height.
-    // That height is measured from the BODY: the root's scrollHeight is never
-    // less than the frame itself, so a message that got shorter (wider
-    // viewport, a form message replaced by a line) could never shrink back.
-    const contentSized = type === 'modal' || type === 'slideup';
-    const bodySizing = contentSized ? 'body{display:flow-root;}' : '';
-    const bootstrap = `(function(){
-      var CID=${cid},KEY=${key},SIZED=${contentSized ? 'true' : 'false'};
-      // Per-device visibility: tag the root with the REAL device class from the
-      // HOST page viewport (the iframe is message-sized, so its own innerWidth is
-      // useless here). The jr-vp-* → jr-hide-* rules in <style> then hide elements
-      // the dashboard marked "Mobile only" / "Desktop only". <=480 = mobile.
-      try{var __vp=0;try{__vp=window.parent.innerWidth||0;}catch(e){}if(!__vp)__vp=window.innerWidth||0;document.documentElement.className+=(__vp<=480?' jr-vp-mobile':' jr-vp-desktop');}catch(e){}
-      function host(){try{return window.parent[KEY]||null;}catch(e){return null;}}
-      function call(m,args){var b=host();if(b&&typeof b[m]==='function'){try{return b[m].apply(b,[CID].concat(args||[]));}catch(e){}}}
-      window.joryioBridge={
-        logCustomEvent:function(name,props){call('logCustomEvent',[name,props]);},
-        setCustomUserAttribute:function(k,v){call('setCustomUserAttribute',[k,v]);},
-        changeUser:function(uid){call('changeUser',[uid]);},
-        requestPushPermission:function(){call('requestPushPermission',[]);},
-        logConversion:function(ev){call('logConversion',[ev||'in_app_conversion']);},
-        submitForm:function(values){return call('submitForm',[values]);},
-        logClick:function(action){call('logClick',[action]);},
-        navigate:function(url,target){call('navigate',[url,target]);},
-        closeMessage:function(){call('closeMessage',[]);}
-      };
-      document.addEventListener('click',function(e){
-        var el=e.target;
-        while(el&&el!==document.body&&el!==document.documentElement){
-          var action=el.getAttribute&&el.getAttribute('data-joryio-action');
-          if(action&&typeof window.joryioBridge[action]==='function'){e.preventDefault();window.joryioBridge[action](el.getAttribute('data-joryio-event')||undefined);return;}
-          var tag=el.tagName;
-          if(tag==='A'||tag==='BUTTON'){
-            var da=el.getAttribute('data-action');
-            var href=tag==='A'?el.getAttribute('href'):null;
-            window.joryioBridge.logClick(da||(href?'link_click':'cta_click'));
-            // Route only http(s)/root-relative links through the host (top-nav,
-            // since the sandbox can't navigate the top page itself). Leave
-            // #anchors, mailto:, tel:, sms: to the browser. Any other link
-            // would navigate THIS frame away from the message: cancelled (rule 57).
-            if(href&&/^(https?:\\/\\/|\\/(?!\\/))/i.test(href)){e.preventDefault();window.joryioBridge.navigate(href,el.getAttribute('target'));}
-            else if(href&&!/^(#|mailto:|tel:|sms:)/i.test(href)){e.preventDefault();}
-            return;
-          }
-          el=el.parentNode;
-        }
-      },true);
-      // Forms (data-jry-form): serialize, hand the values to the host, show the
-      // answer in place. A redirect goes through navigate (the sandbox cannot).
-      document.addEventListener('submit',function(ev){var f=ev.target;if(!(f&&f.tagName==='FORM'&&f.hasAttribute('data-jry-form')))return;ev.preventDefault();if(f.getAttribute('data-jry-busy'))return;
-        var d={},els=f.querySelectorAll('input,select,textarea');for(var i=0;i<els.length;i++){var el=els[i],n=el.name;if(!n||el.disabled)continue;if(el.type==='checkbox'){if(!el.checked)continue;if(d[n]===undefined)d[n]=[];d[n].push(el.value||'on')}else if(el.type==='radio'){if(el.checked)d[n]=el.value}else d[n]=el.value}
-        function msg(text,ok){var b=f.querySelector('[data-jry-message]');if(!b){b=document.createElement('div');b.setAttribute('data-jry-message','');b.setAttribute('role','status');f.appendChild(b)}b.textContent=text;b.className=ok?'jry-form-success':'jry-form-error';reportSize()}
-        f.setAttribute('data-jry-busy','1');var btn=f.querySelector('button[type="submit"],input[type="submit"]');if(btn)btn.disabled=true;
-        var p=window.joryioBridge.submitForm(d);if(!p||typeof p.then!=='function'){msg('This form cannot be sent here.',false);f.removeAttribute('data-jry-busy');if(btn)btn.disabled=false;return}
-        p.then(function(r){if(r&&r.ok){if(r.redirect){window.joryioBridge.navigate(r.redirect,'_top');return}var els2=f.querySelectorAll('input,select,textarea,button');for(var j=0;j<els2.length;j++){els2[j].disabled=true}msg(r.message||'Thank you.',true)}else{msg((r&&(r.message||(r.errors&&r.errors[0])))||'Something went wrong. Please try again.',false);f.removeAttribute('data-jry-busy');if(btn)btn.disabled=false}}).catch(function(){msg('Something went wrong. Please try again.',false);f.removeAttribute('data-jry-busy');if(btn)btn.disabled=false});
-      },true);
-      function reportSize(){try{var b=document.body,de=document.documentElement;var w=Math.max(b?b.scrollWidth:0,de.scrollWidth);var h=SIZED&&b?Math.ceil(Math.max(b.scrollHeight,b.getBoundingClientRect?b.getBoundingClientRect().height:0)):Math.max(b?b.scrollHeight:0,de.scrollHeight);call('setSize',[w,h]);}catch(e){}}
-      if(document.readyState!=='loading')reportSize();else document.addEventListener('DOMContentLoaded',reportSize);
-      window.addEventListener('load',reportSize);
-      try{if(window.ResizeObserver&&document.body){new ResizeObserver(reportSize).observe(document.body);}}catch(e){}
-    })();`;
-    // Per-device visibility rules (kept in sync with the editor's
-    // inAppEditorPanels.VISIBILITY_RULES_CSS). The bootstrap above sets the
-    // jr-vp-* root class from the real device.
-    const visRules =
-      '.jr-vp-mobile .jr-hide-mobile{display:none!important}.jr-vp-desktop .jr-hide-desktop{display:none!important}';
-    /*
-     * A per-document CSP, and the nonce is the point.
-     *
-     * The server keeps the author's markup as written (sanitizeInAppHtml drops
-     * only <base> and meta refresh), so author <script> blocks and on*
-     * handlers ARE in this document. Because this iframe is `allow-scripts
-     * allow-same-origin`, they would run at the HOST PAGE'S ORIGIN - XSS on a
-     * customer's site, reachable from a compromised marketing account.
-     *
-     * `script-src 'nonce-...'` is the control: only the bootstrap below carries
-     * the nonce, so nothing the author wrote executes. There is no server
-     * sanitiser in front of it; this CSP is the first line, not a backstop.
-     *
-     * The rest is least-privilege for content that is only ever a message:
-     *   default-src 'none'  nothing is allowed unless named below
-     *   style-src unsafe-inline  author style="" attributes are kept, so this
-     *                       must stay permissive; styles cannot execute
-     *   img/media/font https: data:  no http subresources - the mixed-content
-     *                       control Android enforced and iOS could not
-     *   upgrade-insecure-requests  an author's http image is upgraded rather
-     *                       than simply broken, so it still has a chance to load
-     *   connect-src 'none'  the bridge is a same-origin property call, not a
-     *                       fetch, so nothing legitimate needs the network
-     */
-    const nonce = randomNonce();
-    const csp = [
-      "default-src 'none'",
-      `script-src 'nonce-${nonce}'`,
-      "style-src 'unsafe-inline'",
-      'img-src https: data:',
-      'media-src https: data:',
-      'font-src https: data:',
-      "connect-src 'none'",
-      "form-action 'none'",
-      "base-uri 'none'",
-      'upgrade-insecure-requests',
-    ].join('; ');
-
-    // The author's CSS goes inside <style>: a `</style>` in it would end the
-    // sheet and inject markup (a meta refresh, a form) into the message
-    // document. `</` is written `<\/` - the same characters to the CSS parser,
-    // never an end tag to the HTML parser (rule 57).
-    css = escapeStyleText(css);
-    return `<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="${csp}"><meta name="viewport" content="width=device-width, initial-scale=1"><style>html,body{margin:0;padding:0;}img,video{max-width:100%;height:auto;}${bodySizing}${visRules}${css}</style></head><body>${html}<script nonce="${nonce}">${bootstrap}</script></body></html>`;
+    return buildInAppSrcdoc(campaignId, html, css, type);
   }
 
   /**
@@ -2424,6 +2386,7 @@ export class InAppMessagingManager {
           headers: {
             'Content-Type': 'application/json',
             'X-SDK-Key': this.sdkKey,
+            ...sdkIdentityHeaders(),
             ...(this.auth?.getSdkAuthHeaders(subjectUser, subjectUser ? null : this.identity.getAnonymousId()) || {}),
           },
           body: JSON.stringify({
@@ -2531,6 +2494,7 @@ export class InAppMessagingManager {
         headers: {
           'Content-Type': 'application/json',
           'X-SDK-Key': this.sdkKey,
+          ...sdkIdentityHeaders(),
           ...(this.auth?.getSdkAuthHeaders(subjectUser, subjectUser ? null : data.anonymousId ?? null) || {}),
         },
         body: JSON.stringify(data),
@@ -2799,6 +2763,8 @@ export class InAppMessagingManager {
    * Destroy in-app messaging
    */
   destroy(): void {
+    this.pageUnsubscribe?.();
+    this.pageUnsubscribe = null;
     this.logger.info('Destroying in-app messaging');
 
     // Every timer, including display delays and the sync retry, which used
@@ -2828,5 +2794,170 @@ export class InAppMessagingManager {
     if (typeof window !== 'undefined') {
       delete (window as any)[HOST_BRIDGE_KEY];
     }
+  }
+}
+
+/**
+ * The srcdoc of a sandboxed in-app content frame. `bridgeKey` names the host
+ * window object the frame calls into: the overlay manager's
+ * (HOST_BRIDGE_KEY) or the placements manager's (placements.ts). One builder,
+ * so the nonce CSP and the bootstrap cannot drift between the two surfaces.
+ */
+export function buildInAppSrcdoc(
+  campaignId: string,
+  html: string,
+  css: string,
+  type: InAppCampaign['type'] | 'placement',
+  bridgeKey: string = HOST_BRIDGE_KEY,
+): string {
+  const cid = JSON.stringify(campaignId);
+  const key = JSON.stringify(bridgeKey);
+  // Content-sized types: the HOST picks the width (min(maxWidth, viewport -
+  // margin)) and only the height follows the content. The body used to be
+  // inline-block so its width could be measured and the frame set to it -
+  // which let the frame start narrow and stay narrow. Now the body is a
+  // normal block at the frame's width; flow-root keeps the first and last
+  // child's margins inside it, so its height is the content's height.
+  // That height is measured from the BODY: the root's scrollHeight is never
+  // less than the frame itself, so a message that got shorter (wider
+  // viewport, a form message replaced by a line) could never shrink back.
+  const contentSized = type === 'modal' || type === 'slideup' || type === 'placement';
+  const bodySizing = contentSized ? 'body{display:flow-root;}' : '';
+  const bootstrap = `(function(){
+    var CID=${cid},KEY=${key},SIZED=${contentSized ? 'true' : 'false'};
+    // Per-device visibility: tag the root with the REAL device class from the
+    // HOST page viewport (the iframe is message-sized, so its own innerWidth is
+    // useless here). The jr-vp-* → jr-hide-* rules in <style> then hide elements
+    // the dashboard marked "Mobile only" / "Desktop only". <=480 = mobile.
+    try{var __vp=0;try{__vp=window.parent.innerWidth||0;}catch(e){}if(!__vp)__vp=window.innerWidth||0;document.documentElement.className+=(__vp<=480?' jr-vp-mobile':' jr-vp-desktop');}catch(e){}
+    function host(){try{return window.parent[KEY]||null;}catch(e){return null;}}
+    function call(m,args){var b=host();if(b&&typeof b[m]==='function'){try{return b[m].apply(b,[CID].concat(args||[]));}catch(e){}}}
+    window.joryioBridge={
+      logCustomEvent:function(name,props){call('logCustomEvent',[name,props]);},
+      setCustomUserAttribute:function(k,v){call('setCustomUserAttribute',[k,v]);},
+      changeUser:function(uid){call('changeUser',[uid]);},
+      requestPushPermission:function(){call('requestPushPermission',[]);},
+      logConversion:function(ev){call('logConversion',[ev||'in_app_conversion']);},
+      submitForm:function(values){return call('submitForm',[values]);},
+      logClick:function(action){call('logClick',[action]);},
+      navigate:function(url,target){call('navigate',[url,target]);},
+      closeMessage:function(){call('closeMessage',[]);}
+    };
+    document.addEventListener('click',function(e){
+      var el=e.target;
+      while(el&&el!==document.body&&el!==document.documentElement){
+        var action=el.getAttribute&&el.getAttribute('data-joryio-action');
+        if(action&&typeof window.joryioBridge[action]==='function'){e.preventDefault();window.joryioBridge[action](el.getAttribute('data-joryio-event')||undefined);return;}
+        var tag=el.tagName;
+        if(tag==='A'||tag==='BUTTON'){
+          var da=el.getAttribute('data-action');
+          var href=tag==='A'?el.getAttribute('href'):null;
+          window.joryioBridge.logClick(da||(href?'link_click':'cta_click'));
+          // Route only http(s)/root-relative links through the host (top-nav,
+          // since the sandbox can't navigate the top page itself). Leave
+          // #anchors, mailto:, tel:, sms: to the browser. Any other link
+          // would navigate THIS frame away from the message: cancelled (rule 57).
+          if(href&&/^(https?:\\/\\/|\\/(?!\\/))/i.test(href)){e.preventDefault();window.joryioBridge.navigate(href,el.getAttribute('target'));}
+          else if(href&&!/^(#|mailto:|tel:|sms:)/i.test(href)){e.preventDefault();}
+          return;
+        }
+        el=el.parentNode;
+      }
+    },true);
+    // Forms (data-jry-form): serialize, hand the values to the host, show the
+    // answer in place. A redirect goes through navigate (the sandbox cannot).
+    document.addEventListener('submit',function(ev){var f=ev.target;if(!(f&&f.tagName==='FORM'&&f.hasAttribute('data-jry-form')))return;ev.preventDefault();if(f.getAttribute('data-jry-busy'))return;
+      var d={},els=f.querySelectorAll('input,select,textarea');for(var i=0;i<els.length;i++){var el=els[i],n=el.name;if(!n||el.disabled)continue;if(el.type==='checkbox'){if(!el.checked)continue;if(d[n]===undefined)d[n]=[];d[n].push(el.value||'on')}else if(el.type==='radio'){if(el.checked)d[n]=el.value}else d[n]=el.value}
+      function msg(text,ok){var b=f.querySelector('[data-jry-message]');if(!b){b=document.createElement('div');b.setAttribute('data-jry-message','');b.setAttribute('role','status');f.appendChild(b)}b.textContent=text;b.className=ok?'jry-form-success':'jry-form-error';reportSize()}
+      f.setAttribute('data-jry-busy','1');var btn=f.querySelector('button[type="submit"],input[type="submit"]');if(btn)btn.disabled=true;
+      var p=window.joryioBridge.submitForm(d);if(!p||typeof p.then!=='function'){msg('This form cannot be sent here.',false);f.removeAttribute('data-jry-busy');if(btn)btn.disabled=false;return}
+      p.then(function(r){if(r&&r.ok){if(r.redirect){window.joryioBridge.navigate(r.redirect,'_top');return}var els2=f.querySelectorAll('input,select,textarea,button');for(var j=0;j<els2.length;j++){els2[j].disabled=true}msg(r.message||'Thank you.',true)}else{msg((r&&(r.message||(r.errors&&r.errors[0])))||'Something went wrong. Please try again.',false);f.removeAttribute('data-jry-busy');if(btn)btn.disabled=false}}).catch(function(){msg('Something went wrong. Please try again.',false);f.removeAttribute('data-jry-busy');if(btn)btn.disabled=false});
+    },true);
+    function reportSize(){try{var b=document.body,de=document.documentElement;var w=Math.max(b?b.scrollWidth:0,de.scrollWidth);var h=SIZED&&b?Math.ceil(Math.max(b.scrollHeight,b.getBoundingClientRect?b.getBoundingClientRect().height:0)):Math.max(b?b.scrollHeight:0,de.scrollHeight);call('setSize',[w,h]);}catch(e){}}
+    if(document.readyState!=='loading')reportSize();else document.addEventListener('DOMContentLoaded',reportSize);
+    window.addEventListener('load',reportSize);
+    try{if(window.ResizeObserver&&document.body){new ResizeObserver(reportSize).observe(document.body);}}catch(e){}
+  })();`;
+  // Per-device visibility rules (kept in sync with the editor's
+  // inAppEditorPanels.VISIBILITY_RULES_CSS). The bootstrap above sets the
+  // jr-vp-* root class from the real device.
+  const visRules =
+    '.jr-vp-mobile .jr-hide-mobile{display:none!important}.jr-vp-desktop .jr-hide-desktop{display:none!important}';
+  /*
+   * A per-document CSP, and the nonce is the point.
+   *
+   * The server keeps the author's markup as written (sanitizeInAppHtml drops
+   * only <base> and meta refresh), so author <script> blocks and on*
+   * handlers ARE in this document. Because this iframe is `allow-scripts
+   * allow-same-origin`, they would run at the HOST PAGE'S ORIGIN - XSS on a
+   * customer's site, reachable from a compromised marketing account.
+   *
+   * `script-src 'nonce-...'` is the control: only the bootstrap below carries
+   * the nonce, so nothing the author wrote executes. There is no server
+   * sanitiser in front of it; this CSP is the first line, not a backstop.
+   *
+   * The rest is least-privilege for content that is only ever a message:
+   *   default-src 'none'  nothing is allowed unless named below
+   *   style-src unsafe-inline  author style="" attributes are kept, so this
+   *                       must stay permissive; styles cannot execute
+   *   img/media/font https: data:  no http subresources - the mixed-content
+   *                       control Android enforced and iOS could not
+   *   upgrade-insecure-requests  an author's http image is upgraded rather
+   *                       than simply broken, so it still has a chance to load
+   *   connect-src 'none'  the bridge is a same-origin property call, not a
+   *                       fetch, so nothing legitimate needs the network
+   */
+  const nonce = randomNonce();
+  const csp = [
+    "default-src 'none'",
+    `script-src 'nonce-${nonce}'`,
+    "style-src 'unsafe-inline'",
+    'img-src https: data:',
+    'media-src https: data:',
+    'font-src https: data:',
+    "connect-src 'none'",
+    "form-action 'none'",
+    "base-uri 'none'",
+    'upgrade-insecure-requests',
+  ].join('; ');
+
+  // The author's CSS goes inside <style>: a `</style>` in it would end the
+  // sheet and inject markup (a meta refresh, a form) into the message
+  // document. `</` is written `<\/` - the same characters to the CSS parser,
+  // never an end tag to the HTML parser (rule 57).
+  css = escapeStyleText(css);
+  return `<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="${csp}"><meta name="viewport" content="width=device-width, initial-scale=1"><style>html,body{margin:0;padding:0;}img,video{max-width:100%;height:auto;}${bodySizing}${visRules}${css}</style></head><body>${html}<script nonce="${nonce}">${bootstrap}</script></body></html>`;
+}
+
+/**
+ * A trigger's own property condition, e.g. "add_to_cart where value > 100".
+ * Shared by overlays (onEventTracked) and placements (the event-trigger
+ * window), so the two cannot disagree on what an operator means. An UNKNOWN
+ * operator does not match - failing closed.
+ */
+export function inAppTriggerFilterMatches(trigger: InAppTrigger, properties?: Record<string, any>): boolean {
+  if (!trigger.attribute) return true;
+  const actual = properties?.[trigger.attribute];
+  const expected = trigger.value;
+  switch (trigger.operator) {
+    case undefined:
+    case 'equals':
+    case 'eq':
+      return actual === expected;
+    case 'not_equals':
+    case 'neq':
+      return actual !== expected;
+    case 'greater_than':
+    case 'gt':
+      return Number(actual) > Number(expected);
+    case 'less_than':
+    case 'lt':
+      return Number(actual) < Number(expected);
+    case 'contains':
+      return String(actual ?? '').includes(String(expected));
+    case 'exists':
+      return actual !== undefined && actual !== null;
+    default:
+      return false;
   }
 }

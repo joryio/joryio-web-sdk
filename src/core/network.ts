@@ -4,6 +4,7 @@
 
 import type { SubscriptionChannel } from './user';
 import { Logger } from '../utils/logger';
+import { sdkIdentityHeaders } from './config';
 
 export interface NetworkRequest {
   url: string;
@@ -1096,6 +1097,7 @@ export class NetworkClient {
       'Content-Type': 'application/json',
       'X-SDK-Key': this.sdkKey,
       ...callerHeaders,
+      ...sdkIdentityHeaders(),
     };
     // Attach the SDK-auth JWT last so the managed token is authoritative.
     // An anonymous request may carry the storefront identity token instead (D383).
@@ -1258,6 +1260,7 @@ export class NetworkClient {
     const headers: Record<string, string> = {
       'Content-Type': 'application/json',
       'X-SDK-Key': this.sdkKey,
+      ...sdkIdentityHeaders(),
     };
     const subject = identifiedUserOf(body);
     const authToken = this.sdkAuthTokenFor(subject) ?? this.storefrontTokenFor(subject, anonymousIdOfBody(body));

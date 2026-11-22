@@ -3,6 +3,9 @@
  * Main SDK class
  */
 
+import { PageEditManager } from './page-edits';
+import { EditorGate, editorRequested } from './editor-gate';
+import { PageContextTracker } from './page-context';
 import { InitConfig, ResolvedConfig, resolveConfig, SDK_VERSION } from './config';
 import { StorageManager } from './storage';
 import { SessionManager, SESSION_ID_KEY } from './session';
@@ -18,6 +21,10 @@ import {
 } from './network';
 import { UTMManager } from './utm';
 import { InAppMessagingManager, InAppCampaign } from './inapp';
+import { PlacementManager, Placement, PlacementHandle, InsertPlacementOptions, PlacementsUpdatedCallback, PlacementConsent } from './placements';
+import { CardManager, Card, CardFeed, CardFeedHandle, CardsUpdatedCallback, GetCardsOptions, MountCardFeedOptions } from './cards';
+import { LinkRouter, JoryioLinkHandler } from './links';
+import { FlagsManager, FlagsUpdatedCallback } from './flags';
 import { User } from './user';
 import { Logger } from '../utils/logger';
 import { getDeviceProperties } from './device';
@@ -254,6 +261,17 @@ export class JoryioSDK {
   private network!: NetworkClient;
   private utm!: UTMManager;
   private inapp!: InAppMessagingManager;
+  /** Placements: spots inside the page filled per visitor (placements.ts). */
+  private placements!: PlacementManager;
+  /** Content cards: the person's feed (cards.ts). */
+  private cards!: CardManager;
+  // Created with the instance, so setLinkHandler works before init().
+  private links = new LinkRouter((error) => this.logger?.error('Your link handler threw; the link opens as without one:', error));
+  private pageContext!: PageContextTracker;
+  private pageEdits!: PageEditManager;
+  private editor: EditorGate | null = null;
+  /** Feature flags + remote config (flags.ts). */
+  private flags!: FlagsManager;
   private _user!: User;
   private _push!: PushManager;
   private _ecommerce: EcommerceTracker | null = null;
@@ -531,6 +549,86 @@ export class JoryioSDK {
     // false, so every HTML campaign is refused with no way to opt in.
     this.inapp.setAllowHtmlJsInAppMessages(this.config.inApp.allowHtmlJsInAppMessages);
 
+    // Page context (D444 Phase 4): one tracker for overlays, placements and page edits.
+    this.pageContext = new PageContextTracker(this.config.pageContext);
+    // UTM page rules (D444 Phase 4 follow-up): the UTM this SDK already recorded, when capture is on.
+    this.pageContext.setUtmSource(() => (this.config.captureUTM && this.utm ? this.utm.getUTMData() : null));
+    this.inapp.setPageContext(this.pageContext);
+
+    this.placements = new PlacementManager(
+      this.config.apiEndpoint,
+      this.config.sdkKey,
+      this.identity,
+      this.session,
+      this.logger,
+      {
+        consent: () => this.placementConsent(),
+        allowHtml: () => this.config.inApp.allowHtmlJsInAppMessages,
+        requestTimeoutMs: this.config.requestTimeout,
+        noteStatus: (status, data) => this.network.noteSuspended(status, data),
+        bridge: {
+          logCustomEvent: (name, properties) => this.track(name, properties),
+          setCustomUserAttribute: (key, value) => this.setAttribute(key, value),
+          changeUser: (userId) => this.identify(userId),
+          requestPushPermission: () => {
+            this._push.subscribe().catch((error) => this.logger.warn('Push subscribe failed:', error));
+          },
+        },
+      },
+      this.network,
+    );
+    this.placements.setPageContext(this.pageContext);
+
+    // Page edits (D444 Phase 4): selector edits from page-edit campaigns.
+    this.pageEdits = new PageEditManager(
+      this.config.apiEndpoint,
+      this.config.sdkKey,
+      this.identity,
+      this.session,
+      this.logger,
+      {
+        consent: () => this.placementConsent(),
+        requestTimeoutMs: this.config.requestTimeout,
+        noteStatus: (status, data) => this.network.noteSuspended(status, data),
+      },
+      this.network,
+    );
+    this.pageEdits.setPageContext(this.pageContext);
+
+    this.cards = new CardManager(
+      this.config.apiEndpoint,
+      this.config.sdkKey,
+      this.identity,
+      this.session,
+      this.logger,
+      {
+        consent: () => this.placementConsent(),
+        requestTimeoutMs: this.config.requestTimeout,
+        noteStatus: (status, data) => this.network.noteSuspended(status, data),
+        cardsUiScriptUrl: this.config.cardsUiScriptUrl,
+      },
+      this.network,
+    );
+
+    // One link router for every surface that opens a link (setLinkHandler).
+    this.inapp.links = this.links;
+    this.placements.links = this.links;
+    this.cards.links = this.links;
+
+    this.flags = new FlagsManager(
+      this.config.apiEndpoint,
+      this.config.sdkKey,
+      this.identity,
+      this.session,
+      this.logger,
+      {
+        canSend: () => this.isInitialized && !this.disabled && !this.network.isSuspended() && this.canSend(),
+        requestTimeoutMs: this.config.requestTimeout,
+        noteStatus: (status, data) => this.network.noteSuspended(status, data),
+      },
+      this.network,
+    );
+
     // Initialize user object for subscription management
     this._user = new User(
       this.logger,
@@ -644,6 +742,26 @@ export class JoryioSDK {
     // must get a working SDK rather than this one.
     if (!this.disabled) JoryioSDK.instance = this;
     this.logger.info('SDK initialized successfully');
+
+    // <div data-joryio-placement="key"> elements, now and as the page changes.
+    if (!this.disabled && this.config.inApp.autoMountPlacements) this.placements.autoMount();
+    // Route changes, scroll depth, time on page, exit intent (D444 Phase 4).
+    if (!this.disabled) this.pageContext.start();
+    // `pageEdits: false` (init): no page edit, no anti-flicker, no editor - whatever the server says.
+    if (!this.disabled && this.config.pageEdits) {
+      if (editorRequested()) {
+        // The dashboard's point-and-click editor opened this tab: the page as
+        // the site draws it (no page edits), and the picker once the token is
+        // vouched for - only then is the editor's own file loaded. Nothing
+        // happens for a tab that was not opened that way.
+        this.editor = new EditorGate(this.config.apiEndpoint, this.config.sdkKey, this.logger, { scriptUrl: this.config.editorScriptUrl });
+        this.editor.start();
+      } else {
+        this.pageEdits.start();
+      }
+    }
+    // Flags: the stored answer is readable at once; refresh it now and when the page is shown again.
+    if (!this.disabled) this.flags.start();
 
     // Report permission state now the SDK is live - only when this site uses
     // web push (see pushPermissionReported), and only on a change.
@@ -958,6 +1076,11 @@ export class JoryioSDK {
         this.pinAnonymousWrites();
         this.network.switchUser(userId);
         this.identity.adopt(anonymousId, userId);
+        this.placements.invalidate();
+        // Another person: the anonymous visitor's card state goes too.
+        this.cards.invalidate(true);
+        this.pageEdits?.invalidate();
+        this.flags.onIdentityChanged();
         // Whoever was kept for withdrawals here belongs to the old identity.
         this.withdrawalUserId = null;
         if (loggedOut) {
@@ -1345,6 +1468,15 @@ export class JoryioSDK {
     if (wasOptedOut !== this.isOptedOut || wasPending !== this.consentPending) {
       // In-app answers requested under the previous state are stale.
       this.inapp.invalidate();
+      // Placement answers too: a grant turns generic answers personal, a
+      // refusal turns personal answers generic.
+      this.placements?.invalidate();
+      // The card feed is asked for only with consent: a grant fetches it, a refusal empties it.
+      this.cards?.invalidate(false);
+      // Consent changed: the stored site settings go too (as every per-workspace store).
+      this.pageEdits?.invalidate({ siteSettings: true });
+      // Flags too: without consent nothing is read or sent; a grant fetches.
+      this.flags?.onIdentityChanged();
     }
 
     if (this.isOptedOut) {
@@ -1738,6 +1870,7 @@ export class JoryioSDK {
       if (this.canSend()) {
         try {
           this.inapp?.onEventTracked(eventName, eventProperties);
+          this.placements?.onEventTracked(eventName, eventProperties);
         } catch (error) {
           this.logger.error('In-app trigger evaluation failed:', error);
         }
@@ -1814,7 +1947,13 @@ export class JoryioSDK {
     // set is B's own. Also keeps the user id for auth-failure reporting.
     this.network.switchUser(userId);
     // In-app answers requested for the previous identity are stale.
-    if (previousUserId !== userId) this.inapp.invalidate();
+    if (previousUserId !== userId) {
+      this.inapp.invalidate();
+      this.placements.invalidate();
+      this.cards.invalidate(true);
+      this.pageEdits?.invalidate();
+      this.flags.onIdentityChanged();
+    }
 
     if (!this.canSend()) return; // consent pending: sent when granted
 
@@ -2375,7 +2514,12 @@ export class JoryioSDK {
     // New anonymous id, no user id.
     this.pinAnonymousWrites();
     this.identity.reset(anonymousId);
+    this.flags.onIdentityChanged();
     this.network.setCurrentUserId(this.identity.getUserId());
+    this.placements.invalidate();
+    this.cards.invalidate(true);
+    // reset / resetTo: the stored site settings go too (identify keeps them - the same for every visitor).
+    this.pageEdits?.invalidate({ siteSettings: true });
 
     // UTM before the session: the new session's Session Start (tracked by the
     // session's onNewSession hook) must not carry the outgoing user's campaign.
@@ -2482,7 +2626,11 @@ export class JoryioSDK {
     this.forgetDeferredIdentify();
     this.pinAnonymousWrites();
     this.identity.reset();
+    this.flags.onIdentityChanged();
     this.network.setCurrentUserId(null);
+    this.placements.invalidate();
+    this.cards?.invalidate(true);
+    this.pageEdits?.invalidate({ siteSettings: true });
     this.utm.reset();
     this.session.clear();
     this.lastTrackedUrl = null;
@@ -3250,6 +3398,229 @@ export class JoryioSDK {
   }
 
   /**
+   * What a placement request may carry (docs/PLACEMENTS_PLAN.md 3.9): null =
+   * nothing may be sent at all; `granted` = the visitor is named and their
+   * interactions reported; `pending` / `denied` (opted out and Do Not Track
+   * included) = an anonymous request for generic content, nothing reported.
+   */
+  private placementConsent(): PlacementConsent | null {
+    if (!this.isInitialized || this.disabled || this.network.isSuspended()) return null;
+    if (this.canSend()) return 'granted';
+    return this.consentPending ? 'pending' : 'denied';
+  }
+
+  /**
+   * Receive EVERY link the SDK is about to open - an in-app message button or
+   * link, a placement button, a card click - before it opens: http(s) links
+   * and app deep links (`myapp://cart`) alike, with where it came from
+   * (`link.source`: in_app, placement, card) and the ids that go with it.
+   * Return true to take the link over - route it with your single-page app's
+   * router instead of a new tab - or false to let the SDK open it as it does
+   * without a handler. A refused scheme (javascript:, data:, ...) never
+   * reaches it. Synchronous on purpose: the click's user activation still
+   * holds when the SDK opens a tab. Works before init(). Same name on iOS,
+   * Android, React Native and Unity (`SetLinkHandler`).
+   */
+  setLinkHandler(handler: JoryioLinkHandler): void {
+    if (typeof handler !== 'function') {
+      this.logger?.warn('setLinkHandler() needs a function; use clearLinkHandler() to remove one');
+      return;
+    }
+    this.links.setHandler(handler);
+  }
+
+  /** Remove the handler set with setLinkHandler: links open as they do without one. */
+  clearLinkHandler(): void {
+    this.links.setHandler(null);
+  }
+
+  /**
+   * Draw placement `placementKey` into `element` (docs: Placements). The SDK
+   * fetches, caches and refreshes it, measures viewability and reports
+   * impressions, clicks and dismissals. Returns a handle whose `remove()`
+   * stops it; null for an invalid key or element.
+   */
+  /**
+   * The page's own variables for page targeting (D444 Phase 4), e.g.
+   * `{ pageType: 'product', category: 'shoes' }`. Replaces what was set
+   * before; `null` clears it. Primitives only, at most 20. Call it on every
+   * page (and after each route change in a single-page app). Safe before
+   * init.
+   */
+  setPageVariables(variables: Record<string, string | number | boolean> | null): void {
+    try {
+      this.pageContext?.setPageVariables(variables);
+    } catch (error) {
+      this.logger.warn('setPageVariables failed:', error);
+    }
+  }
+
+  insertPlacement(placementKey: string, element: HTMLElement, options?: InsertPlacementOptions): PlacementHandle | null {
+    if (!this.isInitialized) {
+      this.logger.error('SDK not initialized');
+      return null;
+    }
+    return this.placements.insertPlacement(placementKey, element, options);
+  }
+
+  /**
+   * The placements for `placementKeys`, to draw with your own UI. Report what
+   * the person did with `item.markDisplayed()` (once it was viewable),
+   * `item.markClicked()` and `item.markDismissed()`; for a held-out visitor
+   * (`isControl`), `placement.markDisplayed()` when the empty spot was viewable.
+   */
+  async getPlacements(placementKeys: string[]): Promise<Record<string, Placement>> {
+    if (!this.isInitialized) {
+      this.logger.error('SDK not initialized');
+      return {};
+    }
+    return this.placements.getPlacements(placementKeys);
+  }
+
+  /** Ask the server again (default: every placement on the page). At most once per key per PLACEMENT_MIN_REFRESH_SECONDS. */
+  async refreshPlacements(placementKeys?: string[]): Promise<void> {
+    if (!this.isInitialized) return;
+    await this.placements.refreshPlacements(placementKeys);
+  }
+
+  /** Called with the placements whose content changed. Returns an unsubscribe function. */
+  onPlacementsUpdated(callback: PlacementsUpdatedCallback): () => void {
+    if (!this.isInitialized) {
+      this.logger.error('SDK not initialized');
+      return () => undefined;
+    }
+    return this.placements.onPlacementsUpdated(callback);
+  }
+
+  /**
+   * The person's content cards (docs: Content cards): from the cache while it
+   * is fresh (CARD_FEED_TTL_SECONDS), from the server otherwise. With
+   * `{ cursor: feed.nextCursor }`, the next page - added to the cached feed.
+   * Without tracking consent the feed is empty and nothing is asked.
+   */
+  async getCards(options?: GetCardsOptions): Promise<CardFeed> {
+    if (!this.isInitialized) {
+      this.logger.error('SDK not initialized');
+      return { cards: [], unreadCount: 0, nextCursor: null, stateScope: 'server' };
+    }
+    return this.cards.getCards(options);
+  }
+
+  /** Unread cards in the cached feed (the badge). Never goes to the network. */
+  getUnreadCardCount(): number {
+    if (!this.isInitialized) return 0;
+    return this.cards.getUnreadCardCount();
+  }
+
+  /** Report that a card (or card id) was on screen - the feed drawn by mountCardFeed does this itself. */
+  markCardViewed(card: Card | string): void {
+    if (!this.isInitialized) return;
+    this.cards.markCardViewed(card);
+  }
+
+  /** Mark a card read: the unread count drops at once. A card already read sends nothing. */
+  markCardRead(card: Card | string): void {
+    if (!this.isInitialized) return;
+    this.cards.markCardRead(card);
+  }
+
+  /** Report a tap on a card (it counts as read too). Open `card.url` yourself when you draw the feed. */
+  markCardClicked(card: Card | string): void {
+    if (!this.isInitialized) return;
+    this.cards.markCardClicked(card);
+  }
+
+  /** Dismiss a card: it leaves the feed at once, on every device for a known person. */
+  dismissCard(card: Card | string): void {
+    if (!this.isInitialized) return;
+    this.cards.dismissCard(card);
+  }
+
+  /** Ask the server for the feed again. At most once per CARD_MIN_REFRESH_SECONDS; extra calls coalesce. */
+  async refreshCards(): Promise<void> {
+    if (!this.isInitialized) return;
+    await this.cards.refreshCards();
+  }
+
+  /** Called with the whole feed whenever it changes. Returns an unsubscribe function. */
+  onCardsUpdated(callback: CardsUpdatedCallback): () => void {
+    if (!this.isInitialized) {
+      this.logger.error('SDK not initialized');
+      return () => undefined;
+    }
+    return this.cards.onCardsUpdated(callback);
+  }
+
+  /**
+   * Draw the person's card feed into `element` and keep it up to date. Cards
+   * are reported viewed and read once half of one was on screen for a second,
+   * clicked on a tap (then its http(s) link opens, or a deep link goes to
+   * `onDeepLink`), dismissed on its x. Returns a handle whose `remove()` stops it.
+   * The drawing code is `joryio-cards-ui.min.js`, loaded from the SDK host the
+   * first time a feed is mounted (`cardsUiScriptUrl` to self-host): the handle
+   * comes back at once and the feed appears when the file has loaded. If it
+   * cannot load, a warning is logged and the element gets
+   * `data-joryio-card-feed-state="unavailable"`; the data API keeps working.
+   */
+  mountCardFeed(element: HTMLElement, options?: MountCardFeedOptions): CardFeedHandle | null {
+    if (!this.isInitialized) {
+      this.logger.error('SDK not initialized');
+      return null;
+    }
+    return this.cards.mountCardFeed(element, options);
+  }
+
+  /**
+   * A flag's value for this visitor, or `defaultValue` before the first answer,
+   * for a flag the server did not send, or without tracking consent. Never
+   * waits for the network. The first read in a session logs an exposure.
+   */
+  getFlag<T = unknown>(key: string, defaultValue: T): T {
+    if (!this.isInitialized) return defaultValue;
+    return this.flags.getFlag(key, defaultValue);
+  }
+
+  /** A boolean flag, or `defaultValue` (also for a flag of another type). */
+  getBoolFlag(key: string, defaultValue: boolean): boolean {
+    return this.isInitialized ? this.flags.getBoolFlag(key, defaultValue) : defaultValue;
+  }
+
+  /** A string flag, or `defaultValue`. */
+  getStringFlag(key: string, defaultValue: string): string {
+    return this.isInitialized ? this.flags.getStringFlag(key, defaultValue) : defaultValue;
+  }
+
+  /** A number flag, or `defaultValue`. */
+  getNumberFlag(key: string, defaultValue: number): number {
+    return this.isInitialized ? this.flags.getNumberFlag(key, defaultValue) : defaultValue;
+  }
+
+  /** A JSON flag (object, array or scalar), or `defaultValue`. */
+  getJsonFlag<T = unknown>(key: string, defaultValue: T): T {
+    return this.isInitialized ? this.flags.getJsonFlag(key, defaultValue) : defaultValue;
+  }
+
+  /** Every flag held for this visitor, key -> value. Logs no exposure. */
+  getAllFlags(): Record<string, unknown> {
+    return this.isInitialized ? this.flags.getAllFlags() : {};
+  }
+
+  /** Fetch the flags now. */
+  async refreshFlags(): Promise<void> {
+    if (!this.isInitialized) return;
+    await this.flags.refreshFlags();
+  }
+
+  /** Called with the keys whose value changed. Returns an unsubscribe function. */
+  onFlagsUpdated(callback: FlagsUpdatedCallback): () => void {
+    if (!this.isInitialized) {
+      this.logger.error('SDK not initialized');
+      return () => undefined;
+    }
+    return this.flags.onFlagsUpdated(callback);
+  }
+
+  /**
    * Destroy the SDK instance
    */
   async destroy(): Promise<void> {
@@ -3310,6 +3681,12 @@ export class JoryioSDK {
     // Clear in-app messaging (every timer included)
     this.inapp.clearAll();
     this.inapp.destroy();
+    this.placements.destroy();
+    this.cards.destroy();
+    this.pageEdits?.destroy();
+    this.editor?.stop();
+    this.pageContext?.destroy();
+    this.flags.destroy();
 
     this.isInitialized = false;
     if (JoryioSDK.instance === this) JoryioSDK.instance = null;

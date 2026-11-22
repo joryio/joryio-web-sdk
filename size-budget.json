@@ -1,0 +1,14 @@
+{
+  "_comment": "gzip (level 9) budgets for the hosted bundles, checked by scripts/check-size.js in CI after the build. Set 2026-11-21 (D444 Phase 4 follow-up) at the size after the editor moved to its own file plus about 1 KB headroom: joryio.min.js 63464 bytes gzip (238080 raw), before the split 64424 gzip (240133 raw); joryio-editor.min.js 3111 gzip (7565 raw). Raise a budget only in the PR that needs it, with the reason. Raised 2026-11-21 to 69000 when this branch met main: content cards (#812, getCards + mountCardFeed) and the app-wide link handler (#819) landed on main after the budget was set and took joryio.min.js to 68077 gzip (259015 raw); about 1 KB headroom again. Lowered 2026-11-21 to 68300 when the default card feed's drawing code (mountCardFeed) moved to its own lazily loaded file, joryio-cards-ui.min.js, loaded only by a page that mounts a feed (the card data API stays in the core): joryio.min.js 67289 gzip (255324 raw), before 68077 gzip (259015 raw); joryio-cards-ui.min.js 2242 gzip (5585 raw), budget 2600; about 1 KB headroom on the core again. Raised 2026-11-22 to 69300 (BACKLOG D450, server-side page edits): reading the store plugins' marker, never re-applying a server edit, and undoing one safely (validated URLs, no style strings, only elements still showing the applied value) plus the allowlist rebuild of a restored text took joryio.min.js from 67289 to 68943 gzip (260766 raw); about 350 bytes headroom. Raised 2026-11-22 to 70000 when this branch met main again: main's core had grown from 67289 to 67866 gzip meanwhile (the journey flag override reason and the time on screen / product card follow-ups, #834 #835 #839), so with the page-edit marker code joryio.min.js is 69507 gzip (263082 raw); about 500 bytes headroom. Raised 2026-11-22 to 70500 (1.4.0-beta.4): the site settings kept in sessionStorage for the SDK session (used at once, refreshed in the background at most every 10 minutes) and the side files loaded from the core's own folder (a beta on sdk.joryio.com/web/<beta>/ loads its own editor and card feed) took joryio.min.js from 69507 to 69961 gzip (264781 raw); about 500 bytes headroom.",
+  "files": {
+    "joryio.min.js": {
+      "gzipBytes": 70500
+    },
+    "joryio-editor.min.js": {
+      "gzipBytes": 3500
+    },
+    "joryio-cards-ui.min.js": {
+      "gzipBytes": 2600
+    }
+  }
+}

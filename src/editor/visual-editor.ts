@@ -22,10 +22,13 @@
  * - A light side panel: the element, how many elements its selector matches,
  *   "What do you want to do?" (Change text, Change link, Change image, Hide
  *   it, Add content slot), ONE field set per action, a collapsible CSS
- *   selector, Cancel / Save.
+ *   selector, Cancel / Save. The New text field shows variables as the
+ *   same pills (liquid-field.ts) and stores unchanged Liquid. Selecting an
+ *   element that already has an edit opens that edit.
  * - Every edit shows live on the page while editing (the draft too); the
  *   text with the dashboard's sample values for its variables, else their
- *   fallbacks. Text is set with textContent, addresses must be http(s), the
+ *   fallbacks, else a placeholder pill with the field name (a custom element
+ *   with its own shadow root, never page text). Text is set with textContent, addresses must be http(s), the
  *   original nodes come back on undo - nothing is ever parsed as HTML.
  * - A dock: campaign · variant · page, the hint, "N edits" (a click jumps to
  *   that edit), Undo, "Save & return to Joryio".
@@ -40,15 +43,28 @@
  *                           dashboard already has REPLACES that edit
  *     joryio:editor-remove  { id }                        undo of a new edit
  *     joryio:editor-done    {}                            "Save & return to Joryio"
+ *     joryio:editor-open-slot { placementKey, campaignId? }
+ *                           "Create content for this slot" (no campaignId) or
+ *                           a campaign of the slot (its id): the dashboard
+ *                           opens that campaign, or a new Placement campaign
+ *                           for the slot; sent only to a dashboard that set
+ *                           `openSlot` in its context
  *     joryio:editor-closed  {}                            the editor stopped
  *
  *   dashboard -> editor
  *     joryio:editor-context { campaignName?, variantName?, edits?, focusId?,
- *                             attributes?: [{ name, custom? }], placements?: [{ key, name? }],
+ *                             attributes?: [{ key, label?, group? } | { name, custom? }],
+ *                             placements?: [{ key, name?, campaigns?: [{ id, name, status, statusLabel? }] }],
+ *                             openSlot?: true,
  *                             sample?: { "user.firstName": "Lior", ... },
  *                             strings?: { <EDITOR_STRINGS key>: text }, dir?: 'ltr' | 'rtl' }
  *                           the variant's edits (shown live and in "N edits"),
- *                           the words in the marketer's language; enables Undo
+ *                           the words in the marketer's language; enables Undo.
+ *                           `campaigns` per placement (1.4.0-beta.7): the
+ *                           campaigns that fill that slot, shown on a saved
+ *                           slot edit ("In this slot: ..."); `openSlot`: the
+ *                           dashboard handles joryio:editor-open-slot. An
+ *                           editor before beta.7 ignores both.
  *     joryio:editor-focus   { id }                        jump to that edit
  *     joryio:editor-close   {}                            stop
  *
@@ -60,8 +76,9 @@ import type { Logger } from '../utils/logger';
 import { isSafeSelector, isSafeEditUrl, trustedEdit, type PageEditOperation, type PageEditPosition, type PageEditWire } from '../core/page-edits';
 import { EDITOR_MESSAGES } from '../core/editor-gate';
 import { EDITOR_STRINGS, fill, mergeStrings, type EditorStringKey, type EditorStrings } from './editor-strings';
-import { kindKey, liquidOutputs, newEditId, previewText, setTextFallback, slugify, textFallback, variableTag } from './editor-model';
-import { EDITOR_CSS, HOST_STYLE, PREVIEW_CSS, PREVIEW_HOST_STYLE, h, icon, type IconName } from './editor-ui';
+import { VAR_PATH, kindKey, newEditId, pathTag, previewParts, slugify } from './editor-model';
+import { EDITOR_CSS, HOST_STYLE, PREVIEW_CSS, PREVIEW_HOST_STYLE, PREVIEW_VAR_HOST_STYLE, h, icon, type IconName } from './editor-ui';
+import { liquidField } from './liquid-field';
 
 export { EDITOR_MESSAGES };
 
@@ -70,6 +87,7 @@ export const EDITOR_SESSION_MESSAGES = {
   FOCUS: 'joryio:editor-focus',
   REMOVE: 'joryio:editor-remove',
   DONE: 'joryio:editor-done',
+  OPEN_SLOT: 'joryio:editor-open-slot',
 } as const;
 
 /** Attributes that name an element on purpose, most stable first. */
@@ -99,6 +117,14 @@ export function cssEscape(value: string): string {
 }
 
 const isOurs = (el: Element | null): boolean => !!el && !!el.closest(OURS);
+const VAR_PILL = 'var';
+
+/** The page element an event on the page is about: a variable pill in the preview stands for the element it is in. */
+function pageTarget(t: EventTarget | null): Element | null {
+  let el = t instanceof Element ? t : null;
+  if (el && el.getAttribute('data-joryio-editor') === VAR_PILL) el = el.parentElement;
+  return el && !isOurs(el) && el !== document.body && el !== document.documentElement ? el : null;
+}
 
 /** The page's elements a selector finds - never the editor's own. */
 function pageMatches(selector: string): Element[] {
@@ -214,13 +240,36 @@ interface Draft {
   touched: boolean;
 }
 
+interface Var {
+  path: string;
+  label: string;
+  group: string;
+}
+
+/** The chips shown before "More…": these when the catalog has them, else its first ones. */
+const COMMON_VARS = ['user.firstName', 'user.lastName', 'user.email', 'user.custom.city'];
+const CHIPS = 4;
+
 interface EditorContext {
   campaignName: string;
   variantName: string;
-  attributes: Array<{ name: string; custom: boolean }>;
-  placements: Array<{ key: string; name: string }>;
+  /** The personalization catalog: Liquid path, label, group ('' for the old `{ name, custom }` shape). */
+  attributes: Var[];
+  placements: Array<{ key: string; name: string; campaigns: SlotCampaign[] }>;
   sample: Record<string, string>;
+  /** The dashboard handles joryio:editor-open-slot: the slot's campaigns and "Create content for this slot" show. */
+  openSlot: boolean;
 }
+
+/** A campaign that fills a slot, as the dashboard sent it. */
+interface SlotCampaign {
+  id: string;
+  name: string;
+  /** The wire status (`draft`, `active`, ...), and the dashboard's word for it. */
+  status: string;
+  statusLabel: string;
+}
+const CAMPAIGN_ID = /^[A-Za-z0-9_-]{1,64}$/;
 
 const clip = (v: unknown, n: number): string => (typeof v === 'string' ? v.trim().slice(0, n) : '');
 const shortText = (el: Element | null): string => ((el && el.textContent) || '').replace(/\s+/g, ' ').trim();
@@ -241,6 +290,9 @@ export class VisualEditor {
   private selected: Element | null = null;
   private draft: Draft | null = null;
   private showCss = false;
+  private showLiquid = false;
+  /** Closes an open overlay of the panel (the variable picker) on Esc; true when it closed one. */
+  private closeOverlay: (() => boolean) | null = null;
   private popOpen = false;
   private edits: PageEditWire[] = [];
   private history: Array<{ id: string; before: PageEditWire | null }> = [];
@@ -248,7 +300,7 @@ export class VisualEditor {
   private synced = false;
   private t: EditorStrings = { ...EDITOR_STRINGS };
   private dir: 'ltr' | 'rtl' = 'ltr';
-  private ctx: EditorContext = { campaignName: '', variantName: '', attributes: [], placements: [], sample: {} };
+  private ctx: EditorContext = { campaignName: '', variantName: '', attributes: [], placements: [], sample: {}, openSlot: false };
   private previewUndo: Array<() => void> = [];
   /** The page's own text / address of an element before any preview, for "Was:". */
   private originals = new WeakMap<Element, { text: string; href: string | null; src: string | null }>();
@@ -333,18 +385,21 @@ export class VisualEditor {
 
     const onMove = (e: MouseEvent) => {
       const t = e.target instanceof Element ? e.target : null;
-      if (isOurs(t)) return;
-      this.hovered = t && t !== doc.body && t !== doc.documentElement ? t : null;
+      if (isOurs(t) && t!.getAttribute('data-joryio-editor') !== VAR_PILL) return;
+      this.hovered = pageTarget(t);
       this.place(this.hoverBox, this.hovered === this.selected ? null : this.hovered, true);
     };
     const onClick = (e: MouseEvent) => {
-      if (isOurs(e.target instanceof Element ? e.target : null)) return;
+      if (e.target instanceof Element && e.target.closest('[data-joryio-editor="root"]')) return;
+      // A click on the page - a preview of ours included - never reaches the site.
       e.preventDefault();
       e.stopPropagation();
-      if (e.target instanceof Element && e.target !== doc.body && e.target !== doc.documentElement) this.select(e.target);
+      const el = pageTarget(e.target);
+      if (el) this.select(el);
     };
     const onKey = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
+        if (this.closeOverlay && this.closeOverlay()) return;
         if (this.popOpen) this.togglePop(false);
         else if (this.panel) this.cancel();
         else this.stop();
@@ -394,9 +449,38 @@ export class VisualEditor {
     this.ctx = {
       campaignName: clip(data.campaignName, 120),
       variantName: clip(data.variantName, 60),
-      attributes: list(data.attributes, (a) => (a && typeof a.name === 'string' && ATTRIBUTE_NAME.test(a.name) ? { name: a.name, custom: a.custom === true } : null), 40),
-      placements: list(data.placements, (p) => (p && typeof p.key === 'string' && PLACEMENT_KEY_PATTERN.test(p.key) ? { key: p.key, name: clip(p.name, 80) } : null), 40),
+      // Both shapes: the catalog's { key, label, group } and the older { name, custom }.
+      attributes: list(
+        data.attributes,
+        (a): Var | null =>
+          !a
+            ? null
+            : typeof a.key === 'string' && VAR_PATH.test(a.key)
+              ? { path: a.key, label: clip(a.label, 60) || a.key.split('.').pop()!, group: clip(a.group, 40) }
+              : typeof a.name === 'string' && ATTRIBUTE_NAME.test(a.name)
+                ? { path: `user.${a.custom === true ? 'custom.' : ''}${a.name}`, label: a.name, group: '' }
+                : null,
+        400,
+      ),
+      placements: list(
+        data.placements,
+        (p) =>
+          p && typeof p.key === 'string' && PLACEMENT_KEY_PATTERN.test(p.key)
+            ? {
+                key: p.key,
+                name: clip(p.name, 80),
+                campaigns: list(
+                  p.campaigns,
+                  (c): SlotCampaign | null =>
+                    c && typeof c.id === 'string' && CAMPAIGN_ID.test(c.id) ? { id: c.id, name: clip(c.name, 120) || c.id, status: clip(c.status, 30), statusLabel: clip(c.statusLabel, 40) } : null,
+                  10,
+                ),
+              }
+            : null,
+        200,
+      ),
       sample: {},
+      openSlot: data.openSlot === true,
     };
     if (data.sample && typeof data.sample === 'object') {
       for (const [k, v] of Object.entries(data.sample as Record<string, unknown>).slice(0, 100)) {
@@ -439,9 +523,22 @@ export class VisualEditor {
     this.select(next);
   }
 
-  /** The element is chosen: open the panel on it (or on one of its edits). */
+  /** The edits on an element (its selector finds it, or is the selector the editor would make for it), oldest first. */
+  private editsOn(el: Element | null): PageEditWire[] {
+    if (!el) return [];
+    const own = robustSelector(el);
+    return this.edits.filter((e) => e.selector === own || pageMatches(e.selector).indexOf(el) >= 0);
+  }
+
+  /**
+   * The element is chosen: open the panel on it. An element that already
+   * has an edit (this session's or the dashboard's) opens that edit - the
+   * most recent one - like jumping to it from the list: its value, its
+   * fallback, and Save updates the same edit.
+   */
   select(el: Element, edit?: PageEditWire): void {
     if (!this.active) return;
+    edit = edit || this.editsOn(el).pop();
     this.selected = el;
     this.hovered = null;
     this.place(this.hoverBox, null);
@@ -533,7 +630,22 @@ export class VisualEditor {
     const edit = d && this.draftEdit(d);
     if (!d || !edit) return;
     const el = this.selected || pageMatches(edit.selector)[0] || null;
-    this.pick(el, edit.selector, edit.operation, edit.value ?? edit.placementKey ?? '', { id: d.editingId || undefined, position: edit.position });
+    const id = d.editingId || newEditId();
+    if (!this.pick(el, edit.selector, edit.operation, edit.value ?? edit.placementKey ?? '', { id, position: edit.position })) return;
+    // A saved slot stays open on its edit, with its campaigns or "Create content for this slot".
+    if (edit.operation === 'insert_placement' && this.ctx.openSlot) this.focusEdit(id);
+  }
+
+  /** "Create content for this slot" or one of its campaigns: the dashboard opens it, in its own tab. */
+  openSlot(placementKey: string, campaignId?: string): boolean {
+    if (!this.ctx.openSlot || !PLACEMENT_KEY_PATTERN.test(placementKey)) return false;
+    this.send({ type: EDITOR_SESSION_MESSAGES.OPEN_SLOT, placementKey, ...(campaignId ? { campaignId } : {}) });
+    try {
+      this.opener.focus();
+    } catch {
+      /* not allowed */
+    }
+    return true;
   }
 
   /**
@@ -646,10 +758,10 @@ export class VisualEditor {
     if (this.selected) this.place(this.selBox, this.selected);
   }
 
-  private previewNode(build: (root: ShadowRoot) => void): HTMLElement {
+  private previewNode(build: (root: ShadowRoot) => void, style = PREVIEW_HOST_STYLE, kind = 'preview'): HTMLElement {
     const n = document.createElement(PREVIEW_TAG);
-    n.setAttribute('data-joryio-editor', 'preview');
-    n.setAttribute('style', PREVIEW_HOST_STYLE);
+    n.setAttribute('data-joryio-editor', kind);
+    n.setAttribute('style', style);
     const root = n.attachShadow({ mode: 'open' });
     root.appendChild(h('style', null, PREVIEW_CSS));
     build(root);
@@ -684,7 +796,9 @@ export class VisualEditor {
     switch (e.operation) {
       case 'replace_text': {
         const kids = Array.from(el.childNodes);
-        el.textContent = previewText(e.value || '', this.ctx.sample);
+        el.textContent = '';
+        // A variable with neither a sample value nor a fallback is a pill, in its own shadow root.
+        for (const p of previewParts(e.value || '', this.ctx.sample)) el.appendChild(typeof p === 'string' ? document.createTextNode(p) : this.previewNode((r) => r.appendChild(h('span', { class: 'v', dir: 'auto' }, this.labelOf(p.path) || p.name)), PREVIEW_VAR_HOST_STYLE, VAR_PILL));
         undo.push(() => {
           el.textContent = '';
           for (const k of kids) el.appendChild(k);
@@ -743,6 +857,12 @@ export class VisualEditor {
     });
     this.help = h('div', { class: 'help', 'data-j': 'help', role: 'note' }, close, h('h3', null, t.helpTitle), row('↑', t.helpUp), row('↓', t.helpDown), row(t.helpClickKey, t.helpClick));
     this.wrap.appendChild(this.help);
+  }
+
+  /** A variable's label from the catalog. */
+  private labelOf(path: string): string | undefined {
+    const v = this.ctx.attributes.filter((a) => a.path === path)[0];
+    return v && v.label;
   }
 
   private editTitle(e: PageEditWire): string {
@@ -831,16 +951,24 @@ export class VisualEditor {
 
     // Body: action tiles, the action's fields, the CSS selector.
     const tiles = h('div', { class: 'tiles', role: 'radiogroup', 'aria-label': t.whatToDo });
+    const mine = this.editsOn(el);
     for (const a of ACTIONS) {
       const on = d.action === a;
       const enabled = on || this.enabled(a, el);
       const off = !enabled ? (a === 'link' ? t.notLink : a === 'image' ? t.notImage : t.noText) : '';
-      const b = h('button', { class: a === 'slot' ? 'tile slot' : 'tile', type: 'button', role: 'radio', 'aria-checked': String(on), disabled: !enabled, 'data-j': `action-${a}` }, icon(ACTION_ICON[a]), h('span', null, h('b', null, t[ACTION_LABEL[a]]), off ? h('small', null, off) : null));
+      // The element's own edit of this kind, if it has one: the tile opens it (an element can carry several edits).
+      const own = mine.filter((e) => ACTION_OF[e.operation] === a).pop();
+      const b = h('button', { class: a === 'slot' ? 'tile slot' : 'tile', type: 'button', role: 'radio', 'aria-checked': String(on), disabled: !enabled, 'data-e': !!own, 'data-j': `action-${a}` }, icon(ACTION_ICON[a]), h('span', null, h('b', null, t[ACTION_LABEL[a]]), off ? h('small', null, off) : null));
       b.addEventListener('click', () => {
         if (!this.draft || this.draft.action === a) return;
-        this.draft.action = a;
-        this.draft.touched = true;
-        if ((a === 'link' || a === 'image') && el) this.draft.url = (a === 'image' ? this.orig(el).src : this.orig(el).href) || '';
+        if (own) this.draft = this.draftOf(own);
+        else {
+          // Another kind of change: a new edit next to the one open (that one stays as it is).
+          if (el && this.draft.editingId) this.draft = this.newDraft(el, this.draft.selector);
+          this.draft.action = a;
+          this.draft.touched = true;
+          if ((a === 'link' || a === 'image') && el) this.draft.url = (a === 'image' ? this.orig(el).src : this.orig(el).href) || '';
+        }
         this.renderPanel();
         this.renderPreview();
       });
@@ -900,52 +1028,122 @@ export class VisualEditor {
   private renderFields(box: HTMLElement, d: Draft, el: Element | null, changed: () => void): void {
     const t = this.t;
     box.textContent = '';
+    this.closeOverlay = null;
     const was = (v: string | null) => (v ? h('span', { class: 'was', title: v }, fill(t.was, { value: v.slice(0, 60) })) : null);
     if (d.action === 'text') {
-      const area = h('textarea', { rows: '3', dir: 'auto', 'data-j': 'text', 'aria-label': t.newText });
-      area.value = d.text;
-      const fb = h('div', { 'data-j': 'fallback-box' });
-      const renderFallback = () => {
-        fb.textContent = '';
-        const current = textFallback(d.text);
-        if (current === null) return;
-        const input = h('input', { dir: 'auto', 'data-j': 'fallback', 'aria-label': t.fallback });
-        input.value = current;
-        input.addEventListener('input', () => {
-          d.text = setTextFallback(d.text, input.value);
-          area.value = d.text;
-          changed();
-        });
-        fb.append(h('div', { class: 'mt' }, h('label', { class: 'lbl' }, t.fallback), input, h('div', { class: 'help2' }, t.fallbackHelp)));
-      };
-      let hadVars = liquidOutputs(d.text).length > 0;
-      area.addEventListener('input', () => {
-        d.text = area.value;
-        const hasVars = liquidOutputs(d.text).length > 0;
-        if (hasVars !== hadVars) {
-          hadVars = hasVars;
-          renderFallback();
-        }
+      let code: HTMLTextAreaElement | null = null;
+      const textChanged = (v: string) => {
+        d.text = v;
+        if (code && code !== this.root?.activeElement) code.value = v;
         changed();
+      };
+      // Each pill has its own "If <field> is missing" (a click on it): the `| default:` of that variable only.
+      const field = liquidField({
+        label: t.newText,
+        rawNote: t.rawNote,
+        root: this.root,
+        onChange: textChanged,
+        labelOf: (p) => this.labelOf(p),
+        fallback: { title: t.fallbackFor, help: t.fallbackHelp, bad: t.fallbackBad, done: t.fallbackDone },
       });
+      field.set(d.text);
+      const add = (v: Var) => field.insert(pathTag(v.path));
+      const vars: Var[] = this.ctx.attributes.length ? this.ctx.attributes : ['firstName', 'lastName'].map((n) => ({ path: `user.${n}`, label: n, group: '' }));
+      const common = COMMON_VARS.map((p) => vars.filter((v) => v.path === p)[0]).filter(Boolean);
+      const shown = common.concat(vars.filter((v) => common.indexOf(v) < 0)).slice(0, CHIPS);
       const chips = h('div', { class: 'chips', 'data-j': 'chips' }, h('span', null, t.insert));
-      const vars = this.ctx.attributes.length ? this.ctx.attributes : [{ name: 'firstName', custom: false }, { name: 'lastName', custom: false }];
-      for (const v of vars.slice(0, 12)) {
-        const c = h('button', { class: 'vc', type: 'button', 'data-j': 'chip' }, v.name);
-        c.addEventListener('click', () => {
-          const tag = variableTag(v.name, v.custom, textFallback(d.text) || null);
-          d.text = d.text ? `${d.text.replace(/\s+$/, '')} ${tag}` : tag;
-          area.value = d.text;
-          if (!hadVars) {
-            hadVars = true;
-            renderFallback();
-          }
-          changed();
-        });
+      const picker = h('div', { class: 'pk', 'data-j': 'var-picker', hidden: true });
+      for (const v of shown) {
+        const c = h('button', { class: 'vc', type: 'button', title: v.path, 'data-j': 'chip' }, v.label);
+        c.addEventListener('mousedown', (e) => e.preventDefault()); // the caret stays in the text
+        c.addEventListener('click', () => add(v));
         chips.appendChild(c);
       }
-      box.append(h('div', { class: 'fr' }, h('label', { class: 'lbl' }, t.newText), was(el ? this.orig(el).text : null)), area, chips, fb);
-      renderFallback();
+      if (vars.length > shown.length) {
+        // "More…": the whole catalog, searchable, by group; ↑ ↓ Enter in the search box, Esc closes.
+        const more = h('button', { class: 'vc', type: 'button', 'aria-expanded': 'false', 'data-j': 'more' }, t.more);
+        const search = h('input', { dir: 'auto', 'aria-label': t.search, placeholder: t.search, 'data-j': 'var-search', role: 'combobox', 'aria-expanded': 'true' });
+        const listEl = h('div', { role: 'listbox', 'aria-label': t.insert, 'data-j': 'var-list' });
+        picker.append(search, listEl);
+        let hits: Var[] = [];
+        let at = 0;
+        const close = () => {
+          if (picker.hidden) return false;
+          picker.hidden = true;
+          more.setAttribute('aria-expanded', 'false');
+          return true;
+        };
+        const pick = (v: Var | undefined) => {
+          if (!v) return;
+          close();
+          add(v);
+        };
+        const draw = () => {
+          const q = search.value.trim().toLowerCase();
+          hits = vars.filter((v) => !q || `${v.label} ${v.path} ${v.group}`.toLowerCase().indexOf(q) >= 0).slice(0, 200);
+          at = Math.min(at, Math.max(hits.length - 1, 0));
+          listEl.textContent = '';
+          if (!hits.length) listEl.appendChild(h('div', { class: 'g' }, t.noMatch));
+          let group: string | null = null;
+          hits.forEach((v, i) => {
+            if (v.group !== group) {
+              group = v.group;
+              if (group) listEl.appendChild(h('div', { class: 'g', role: 'presentation' }, group));
+            }
+            const o = h('div', { class: 'o', role: 'option', id: `jv${i}`, 'aria-selected': String(i === at), 'data-j': 'var-option' }, h('span', { dir: 'auto' }, v.label), h('code', { dir: 'ltr' }, v.path));
+            o.addEventListener('mousedown', (e) => e.preventDefault());
+            o.addEventListener('click', () => pick(v));
+            listEl.appendChild(o);
+          });
+          search.setAttribute('aria-activedescendant', hits.length ? `jv${at}` : '');
+        };
+        search.addEventListener('input', () => {
+          at = 0;
+          draw();
+        });
+        search.addEventListener('keydown', (e) => {
+          if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+            e.preventDefault();
+            at = (at + (e.key === 'ArrowDown' ? 1 : hits.length - 1)) % Math.max(hits.length, 1);
+            draw();
+            const o = listEl.querySelector('[aria-selected="true"]') as HTMLElement | null;
+            if (o && o.scrollIntoView) o.scrollIntoView({ block: 'nearest' });
+          } else if (e.key === 'Enter') {
+            e.preventDefault();
+            pick(hits[at]);
+          }
+        });
+        more.addEventListener('mousedown', (e) => e.preventDefault());
+        more.addEventListener('click', () => {
+          if (close()) return;
+          picker.hidden = false;
+          more.setAttribute('aria-expanded', 'true');
+          search.value = '';
+          at = 0;
+          draw();
+          search.focus();
+        });
+        this.closeOverlay = () => field.closePop() || close();
+        chips.appendChild(more);
+      }
+      // "Liquid code": the stored text itself, for developers; editing it redraws the pills.
+      const toggle = h('button', { class: 'css', type: 'button', 'aria-expanded': String(this.showLiquid), 'data-j': 'liquid-toggle' }, icon('code', 13), t.liquid, icon(this.showLiquid ? 'up' : 'down', 10));
+      toggle.addEventListener('click', () => {
+        this.showLiquid = !this.showLiquid;
+        this.renderPanel();
+      });
+      if (!this.closeOverlay) this.closeOverlay = () => field.closePop();
+      box.append(h('div', { class: 'fr' }, h('label', { class: 'lbl' }, t.newText), was(el ? this.orig(el).text : null)), field.el, chips, picker, toggle);
+      if (this.showLiquid) {
+        const ta = h('textarea', { class: 'mono', rows: '3', dir: 'ltr', spellcheck: 'false', 'aria-label': t.liquid, 'data-j': 'liquid' });
+        ta.value = d.text;
+        ta.addEventListener('input', () => {
+          field.set(ta.value);
+          textChanged(ta.value);
+        });
+        code = ta;
+        box.appendChild(h('div', { class: 'mt' }, ta));
+      }
     } else if (d.action === 'link' || d.action === 'image') {
       const input = h('input', { type: 'url', dir: 'ltr', inputmode: 'url', placeholder: 'https://', 'data-j': 'url', 'aria-label': d.action === 'link' ? t.newLink : t.newImage });
       input.value = d.url;
@@ -1006,6 +1204,25 @@ export class VisualEditor {
         seg.appendChild(b);
       }
       box.append(h('div', { class: 'mt' }, h('span', { class: 'lbl' }, t.where), seg));
+      // A saved slot: what fills it, from the dashboard (the key as saved, not as being typed).
+      const savedEdit = this.ctx.openSlot && d.editingId ? this.edits.filter((e) => e.id === d.editingId)[0] : undefined;
+      const key = savedEdit && savedEdit.placementKey;
+      if (key) {
+        const camps = (this.ctx.placements.filter((p) => p.key === key)[0] || { campaigns: [] as SlotCampaign[] }).campaigns;
+        const sec = h('div', { class: 'mt slotc', 'data-j': 'slot-content' });
+        const link = (label: string, j: string, id?: string) => {
+          const b = h('button', { class: 'lnk', type: 'button', 'data-j': j }, label);
+          b.addEventListener('click', () => this.openSlot(key, id));
+          return b;
+        };
+        if (!camps.length) sec.appendChild(link(t.slotCreate, 'slot-create'));
+        else {
+          sec.appendChild(h('span', { class: 'lbl' }, t.slotIn));
+          for (const c of camps) sec.appendChild(link(c.statusLabel || c.status ? `${c.name} (${c.statusLabel || c.status})` : c.name, 'slot-campaign', c.id));
+          sec.appendChild(link(t.slotAddAnother, 'slot-add'));
+        }
+        box.appendChild(sec);
+      }
     }
   }
 }

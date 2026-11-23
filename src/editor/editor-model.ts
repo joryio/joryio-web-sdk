@@ -10,58 +10,109 @@ const OUTPUT_TAG = /\{\{-?([\s\S]*?)-?\}\}/g;
 const DEFAULT_FILTER = /\|\s*default\s*:\s*("[^"]*"|'[^']*'|[^|}]*?)\s*(?=\||$)/;
 const unquote = (v: string) => v.trim().replace(/^(["'])([\s\S]*)\1$/, '$2');
 
-/** The `{{ ... }}` outputs of a text: the expression and its `| default:` value, if any. */
-export function liquidOutputs(value: string): Array<{ expr: string; fallback: string | null }> {
-  const out: Array<{ expr: string; fallback: string | null }> = [];
-  const re = new RegExp(OUTPUT_TAG.source, 'g');
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(value || ''))) {
-    const expr = m[1].trim();
-    const d = DEFAULT_FILTER.exec(expr);
-    out.push({ expr, fallback: d ? unquote(d[1]) : null });
-  }
-  return out;
+/**
+ * A fallback as a Liquid string literal. Liquid has no escape inside a
+ * literal, so: double quotes; single quotes when the text has a `"`; with
+ * both, single quotes and each `'` as the typographic apostrophe (U+2019),
+ * so nothing the marketer typed disappears.
+ */
+export const quoted = (fallback: string): string =>
+  !fallback.includes('"') ? `"${fallback}"` : !fallback.includes("'") ? `'${fallback}'` : `'${fallback.replace(/'/g, '\u2019')}'`;
+
+/** A fallback is plain text: no Liquid in it, one line, at most 200 characters. */
+export const isPlainFallback = (v: string): boolean => v.length <= 200 && !/\{[{%]|[}%]\}|[\r\n]/.test(v);
+
+/** The `| default:` value of ONE variable's Liquid (`{{ user.x | default: "y" }}`), or null. */
+export function varFallback(src: string): string | null {
+  const m = /^\{\{-?([\s\S]*?)-?\}\}$/.exec((src || '').trim());
+  const d = m && DEFAULT_FILTER.exec(m[1].trim());
+  return d ? unquote(d[1]) : null;
 }
 
-/** "If a value is missing": the first default of the text's variables; '' when none has one; null when it has no variable. */
-export function textFallback(value: string): string | null {
-  const outs = liquidOutputs(value);
-  if (!outs.length) return null;
-  const withOne = outs.filter((o) => o.fallback !== null)[0];
-  return withOne ? (withOne.fallback as string) : '';
-}
-
-const quoted = (fallback: string) => (fallback.includes('"') ? `'${fallback.replace(/'/g, '')}'` : `"${fallback}"`);
-
-/** Every `{{ ... }}` of the text with `fallback` as its `| default:` (an empty fallback removes it). */
-export function setTextFallback(value: string, fallback: string): string {
-  return (value || '').replace(new RegExp(OUTPUT_TAG.source, 'g'), (_m, inner: string) => {
-    const expr = inner.trim().replace(new RegExp(DEFAULT_FILTER.source, 'g'), '').trim();
-    return fallback ? `{{ ${expr} | default: ${quoted(fallback)} }}` : `{{ ${expr} }}`;
-  });
+/** ONE variable's Liquid with `fallback` as its own `| default:` (an empty one removes it); its path is kept. */
+export function setVarFallback(src: string, fallback: string): string {
+  const m = /^\{\{-?\s*([A-Za-z_][A-Za-z0-9_.]*)/.exec((src || '').trim());
+  return m ? pathTag(m[1], fallback.trim() || null) : src;
 }
 
 /** The Liquid of one profile field: defaults are `user.<name>`, custom attributes `user.custom.<name>`. */
-export function variableTag(name: string, custom: boolean, fallback?: string | null): string {
-  const path = custom ? `user.custom.${name}` : `user.${name}`;
-  return fallback ? `{{ ${path} | default: ${quoted(fallback)} }}` : `{{ ${path} }}`;
+export const variableTag = (name: string, custom: boolean, fallback?: string | null): string => pathTag(custom ? `user.custom.${name}` : `user.${name}`, fallback);
+
+/** The Liquid of one variable by its path (`user.firstName`, the catalog's `key`). */
+export const pathTag = (path: string, fallback?: string | null): string => (fallback ? `{{ ${path} | default: ${quoted(fallback)} }}` : `{{ ${path} }}`);
+
+/** A Liquid variable path: dotted identifiers (`user.custom.city`). */
+export const VAR_PATH = /^[A-Za-z_][A-Za-z0-9_]{0,63}(\.[A-Za-z_][A-Za-z0-9_]{0,63}){0,4}$/;
+
+/** A variable the editor shows as a placeholder pill: its field name, and (in the text field) its exact Liquid. */
+export interface LiquidVar {
+  name: string;
+  path: string;
+  src: string;
 }
+export type LiquidPart = string | LiquidVar;
+
+const pathName = (path: string) => path.replace(/^user\.(custom\.)?/, '');
 
 /**
  * What the page shows while editing: each `{{ path ... }}` becomes the
  * sample value the dashboard sent for that path (its known visitor), else
- * the fallback (what an unknown visitor sees), else the field name in
- * brackets so an empty spot is still visible.
+ * the fallback (what an unknown visitor sees), else a placeholder pill with
+ * the field name (`{ name }`), so an empty spot is still visible and never
+ * mistaken for page text.
  */
-export function previewText(value: string, sample: Record<string, string>): string {
-  return (value || '').replace(new RegExp(OUTPUT_TAG.source, 'g'), (_m, inner: string) => {
-    const expr = inner.trim();
+export function previewParts(value: string, sample: Record<string, string>): LiquidPart[] {
+  const out: LiquidPart[] = [];
+  const re = new RegExp(OUTPUT_TAG.source, 'g');
+  let last = 0;
+  let m: RegExpExecArray | null;
+  const text = (s: string) => {
+    if (!s) return;
+    if (typeof out[out.length - 1] === 'string') out[out.length - 1] += s;
+    else out.push(s);
+  };
+  value = value || '';
+  while ((m = re.exec(value))) {
+    text(value.slice(last, m.index));
+    last = re.lastIndex;
+    const expr = m[1].trim();
     const path = expr.split('|')[0].trim();
     const d = DEFAULT_FILTER.exec(expr);
-    if (Object.prototype.hasOwnProperty.call(sample, path) && sample[path] !== '') return sample[path];
-    if (d && unquote(d[1])) return unquote(d[1]);
-    return `[${path.replace(/^user\.(custom\.)?/, '')}]`;
-  });
+    if (Object.prototype.hasOwnProperty.call(sample, path) && sample[path] !== '') text(sample[path]);
+    else if (d && unquote(d[1])) text(unquote(d[1]));
+    else out.push({ name: pathName(path), path, src: m[0] });
+  }
+  text(value.slice(last));
+  return out;
+}
+
+/** previewParts as plain text (a pill as `[name]`). */
+export const previewText = (value: string, sample: Record<string, string>): string => previewParts(value, sample).map((p) => (typeof p === 'string' ? p : `[${p.name}]`)).join('');
+
+/** A variable path with at most a quoted `| default:` - what the text field shows as a pill. */
+const SIMPLE_VAR = /^\{\{-?\s*([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*)\s*(?:\|\s*default\s*:\s*(?:"[^"]*"|'[^']*')\s*)?-?\}\}$/;
+
+/**
+ * The text field's view of a text: plain parts and variables (each with its
+ * exact Liquid, so the text round-trips byte for byte), or null when it holds
+ * Liquid a pill cannot show (a tag like `{% if %}`, a filter other than
+ * `default`, a stray brace pair) - the field then stays raw text.
+ */
+export function liquidParts(value: string): LiquidPart[] | null {
+  const out: LiquidPart[] = [];
+  const re = new RegExp(OUTPUT_TAG.source, 'g');
+  let last = 0;
+  let m: RegExpExecArray | null;
+  value = value || '';
+  while ((m = re.exec(value))) {
+    const v = SIMPLE_VAR.exec(m[0]);
+    if (!v) return null;
+    if (m.index > last) out.push(value.slice(last, m.index));
+    out.push({ name: pathName(v[1]), path: v[1], src: m[0] });
+    last = re.lastIndex;
+  }
+  if (last < value.length) out.push(value.slice(last));
+  return out.some((p) => typeof p === 'string' && /\{[{%]|[}%]\}/.test(p)) ? null : out;
 }
 
 /** A slot name as a placement key: lowercase, anything else -> `_`, no leading/trailing `_`, at most 64. */

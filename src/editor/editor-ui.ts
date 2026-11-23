@@ -59,14 +59,25 @@ export const PREVIEW_HOST_STYLE = 'all:initial !important;display:block !importa
 const FONT = 'Inter,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif';
 const MONO = 'ui-monospace,"SF Mono",Menlo,monospace';
 
-export const PREVIEW_CSS = `.s,.x{font:12.5px/1.4 ${FONT};border-radius:10px;padding:14px 16px;text-align:center}.s{border:2px dashed #7A6CFF;background:#F4F2FF;color:#4C3FD1}.s b{font-weight:700}.s code{font-family:${MONO}}.s div{font-size:11.5px;color:#6B5FD9;margin-top:3px}.x{border:1.5px dashed #F04438;background:#FEF3F2;color:#B42318;text-align:start;padding:10px 12px;font-size:12px}`;
+/**
+ * A variable with no sample value and no fallback, in the page preview: an
+ * inline host that takes the site's font and line from the element it is in
+ * (`all: unset`, so nothing else of the site's CSS applies) and is its own
+ * bidi island, so it sits right in a right-to-left text too.
+ */
+export const PREVIEW_VAR_HOST_STYLE = 'all:unset !important;display:inline !important;unicode-bidi:isolate !important';
+
+/** The placeholder pill, the same in the page preview and in the text field: inline, never taller than the line. */
+const PILL = `font-family:${MONO};font-size:.8em;font-weight:600;line-height:1;padding:.12em .5em;border-radius:999px;background:rgba(0,169,154,.14);color:#0F766E;box-shadow:inset 0 0 0 1px rgba(0,169,154,.5);white-space:nowrap;unicode-bidi:isolate;font-style:normal;text-transform:none;letter-spacing:0`;
+
+export const PREVIEW_CSS = `.v{${PILL}}.s,.x{font:12.5px/1.4 ${FONT};border-radius:10px;padding:14px 16px;text-align:center}.s{border:2px dashed #7A6CFF;background:#F4F2FF;color:#4C3FD1}.s b{font-weight:700}.s code{font-family:${MONO}}.s div{font-size:11.5px;color:#6B5FD9;margin-top:3px}.x{border:1.5px dashed #F04438;background:#FEF3F2;color:#B42318;text-align:start;padding:10px 12px;font-size:12px}`;
 
 export const EDITOR_CSS = `
 *{box-sizing:border-box}
 .r{font:13px/1.4 ${FONT};color:#242B3A;-webkit-font-smoothing:antialiased}
 button{font:inherit;color:inherit;cursor:pointer}
 button:disabled{cursor:not-allowed}
-button:focus-visible,input:focus-visible,textarea:focus-visible{outline:2px solid #31D6C8;outline-offset:1px}
+button:focus-visible,input:focus-visible,textarea:focus-visible,.ce:focus{outline:2px solid #31D6C8;outline-offset:1px}
 .box{position:fixed;pointer-events:none;border:2px dashed #00A99A;background:rgba(0,169,154,.07);border-radius:4px;display:none}
 .box.sel{border-style:solid;background:rgba(0,169,154,.04)}
 .chip{position:absolute;bottom:100%;inset-inline-start:-2px;margin-bottom:2px;background:#00A99A;color:#fff;font-size:11px;font-weight:600;padding:3px 8px;border-radius:6px 6px 6px 0;white-space:nowrap;max-width:60vw;overflow:hidden;text-overflow:ellipsis}
@@ -115,19 +126,36 @@ button:focus-visible,input:focus-visible,textarea:focus-visible{outline:2px soli
 .tile[aria-checked=true]{background:#E5F9F6;border-color:#00C8B7;color:#0F766E}
 .tile.slot[aria-checked=true]{background:#F4F2FF;border-color:#7A6CFF;color:#4C3FD1}
 .tile:disabled{opacity:.55}
+.tile[data-e]>span::after{content:'';display:inline-block;width:6px;height:6px;border-radius:9px;background:#00A99A;margin-inline-start:6px;vertical-align:middle}
 .tile b{display:block;font-size:12.5px;font-weight:600;color:#0A1240}
 .tile small{display:block;font-size:10.5px;color:#6B7280}
 .fr{display:flex;align-items:baseline;margin-bottom:8px}
 .fr .lbl{margin:0}
 .was{margin-inline-start:auto;font-size:11.5px;color:#6B7280;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:55%}
-textarea,input{width:100%;font:inherit;font-size:13.5px;color:#0F1424;padding:10px 12px;border-radius:10px;border:1.5px solid #E5EAF2;background:#fff;outline:none}
-textarea{line-height:1.5;resize:vertical;border-color:#00C8B7}
+textarea,input,.ce{width:100%;font:inherit;font-size:13.5px;color:#0F1424;padding:10px 12px;border-radius:10px;border:1.5px solid #E5EAF2;background:#fff;outline:none}
+textarea,.ce{line-height:1.5;resize:vertical;border-color:#00C8B7}
+.ce{min-height:72px;white-space:pre-wrap;overflow-wrap:anywhere;cursor:text}
+.vp{${PILL};cursor:pointer}
+.vp .vfb{font-weight:400;opacity:.75}
+.fbp .vc{margin-top:8px}
+.slotc{display:flex;flex-direction:column;align-items:flex-start;gap:6px}
+.slotc .lbl{margin:0}
+.lnk{border:0;background:none;padding:0;color:#4C3FD1;font-size:12.5px;font-weight:600;text-align:start}
+textarea.mono{height:auto}
 input{height:40px;padding:0 12px}
 input.slotin{border-color:#7A6CFF}
-input.mono{font-family:${MONO};font-size:12px;height:36px;background:#F8FAFC;border-width:1px}
+.mono{font-family:${MONO};font-size:12px;height:36px;background:#F8FAFC;border-width:1px}
 .chips{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px;align-items:center}
 .chips span{font-size:11.5px;color:#6B7280;margin-inline-end:2px}
 .vc{font-family:${MONO};font-size:11.5px;padding:3px 8px;border-radius:6px;border:1px solid #E5EAF2;background:#F8FAFC;color:#3A4060}
+.pk{margin-top:8px;border:1px solid #E5EAF2;border-radius:10px;padding:6px;background:#fff;box-shadow:0 8px 24px rgba(10,18,64,.1)}
+.pk input{height:34px}
+.pk [role=listbox]{max-height:220px;overflow:auto;margin-top:4px}
+.pk .g{font-size:10.5px;font-weight:700;color:#6B7280;text-transform:uppercase;letter-spacing:.4px;padding:8px 8px 3px}
+.pk .o{display:flex;justify-content:space-between;align-items:baseline;gap:8px;padding:6px 8px;border-radius:7px;font-size:12.5px;cursor:pointer}
+.pk .o[aria-selected=true],.pk .o:hover{background:#E5F9F6}
+.pk code{font-family:${MONO};font-size:11px;color:#6B7280;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+[hidden]{display:none!important}
 .help2{font-size:11.5px;color:#6B7280;margin-top:5px}
 .err{font-size:11.5px;color:#B42318;margin-top:5px}
 .mt{margin-top:14px}

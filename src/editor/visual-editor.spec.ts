@@ -6,7 +6,8 @@ import { VisualEditor, robustSelector, operationsFor, cssEscape, EDITOR_MESSAGES
 import { editorApi } from './index';
 import { EDITOR_GLOBAL, EDITOR_API_VERSION } from '../core/editor-gate';
 import { EDITOR_STRINGS } from './editor-strings';
-import { previewText, setTextFallback, slugify, textFallback, variableTag } from './editor-model';
+import { isPlainFallback, liquidParts, previewParts, previewText, quoted, setVarFallback, slugify, varFallback, variableTag } from './editor-model';
+import { serialize } from './liquid-field';
 
 /**
  * The on-site Web personalization editor (D444 Phase 4, design handoff
@@ -59,12 +60,26 @@ const started = () => {
 const $ = (j: string) => editor!.root!.querySelector(`[data-j="${j}"]`) as HTMLElement | null;
 const $$ = (j: string) => Array.from(editor!.root!.querySelectorAll(`[data-j="${j}"]`)) as HTMLElement[];
 const click = (el: Element) => el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, composed: true }));
+/** Typing: a field's value, or the pill box's text (jsdom has no editing, so the box's content is set). */
 const type = (el: HTMLElement, value: string) => {
-  (el as HTMLInputElement).value = value;
+  if (el.tagName === 'DIV') el.textContent = value;
+  else (el as HTMLInputElement).value = value;
   el.dispatchEvent(new Event('input', { bubbles: true }));
 };
 const key = (k: string, target: EventTarget = document.body) => target.dispatchEvent(new KeyboardEvent('keydown', { key: k, bubbles: true, cancelable: true }));
+/** The New text field's value: the textarea's, or the pill box's Liquid. */
+const textValue = () => {
+  const el = $('text')!;
+  return el.tagName === 'DIV' ? serialize(el) : (el as HTMLTextAreaElement).value;
+};
 const picks = () => posted.map((p) => p.msg).filter((m) => m.type === EDITOR_MESSAGES.PICK);
+/** The New text field's variable pills. */
+const pills = () => Array.from(editor!.root!.querySelectorAll('[data-j="text"] [data-liquid]')) as HTMLElement[];
+/** A pill's own fallback: click the pill, type in its popover. */
+const setPillFallback = (i: number, value: string) => {
+  click(pills()[i]);
+  type($('fallback')!, value);
+};
 
 describe('the editor bundle', () => {
   it('registers one global with the contract version, and does nothing until started', () => {
@@ -200,10 +215,10 @@ describe('each action emits its operation', () => {
     expect($('fields')!.textContent).toContain('Was: "One"');
     type($('text')!, 'Picked for you,');
     click($$('chip')[0]);
-    expect(($('text') as HTMLTextAreaElement).value).toBe('Picked for you, {{ user.firstName }}');
+    expect(textValue()).toBe('Picked for you, {{ user.firstName }}');
     expect(h2.textContent).toBe('Picked for you, Lior'); // live, with the sample value
-    type($('fallback')!, 'friend');
-    expect(($('text') as HTMLTextAreaElement).value).toBe('Picked for you, {{ user.firstName | default: "friend" }}');
+    setPillFallback(0, 'friend');
+    expect(textValue()).toBe('Picked for you, {{ user.firstName | default: "friend" }}');
     expect($('save')!.textContent).toBe('Save · Change text');
     click($('save')!);
     expect(picks().at(-1)).toEqual({
@@ -369,7 +384,7 @@ describe('jump to an edit', () => {
     expect(($('slot-name') as HTMLInputElement).value).toBe('after_hero');
     expect($('pos-replace')!.getAttribute('aria-checked')).toBe('true');
     await deliver({ type: EDITOR_SESSION_MESSAGES.FOCUS, id: 'e1' });
-    expect(($('text') as HTMLTextAreaElement).value).toBe('Hi');
+    expect(textValue()).toBe('Hi');
     expect($('title')!.textContent).toBe('Heading "One"');
   });
 
@@ -460,12 +475,614 @@ describe('the Liquid of a personalized text (the dashboard\'s format)', () => {
   it('variables, fallbacks and the preview', () => {
     expect(variableTag('firstName', false)).toBe('{{ user.firstName }}');
     expect(variableTag('city', true, 'there')).toBe('{{ user.custom.city | default: "there" }}');
-    expect(textFallback('Hi')).toBeNull();
-    expect(textFallback('Hi {{ user.firstName }}')).toBe('');
-    expect(setTextFallback('Hi {{ user.firstName }}, {{ user.custom.city | default: "x" }}', 'you')).toBe('Hi {{ user.firstName | default: "you" }}, {{ user.custom.city | default: "you" }}');
+    expect(varFallback('{{ user.firstName }}')).toBeNull();
+    expect(varFallback("{{user.firstName|default:'x'}}")).toBe('x');
+    expect(setVarFallback('{{ user.custom.city | default: "x" }}', 'you')).toBe('{{ user.custom.city | default: "you" }}');
+    expect(setVarFallback('{{ user.custom.city | default: "x" }}', '  ')).toBe('{{ user.custom.city }}');
     expect(previewText('Hi {{ user.firstName | default: "you" }}', { 'user.firstName': 'Lior' })).toBe('Hi Lior');
     expect(previewText('Hi {{ user.firstName | default: "you" }}', {})).toBe('Hi you');
     expect(previewText('Hi {{ user.custom.city }}', {})).toBe('Hi [city]');
     expect(slugify('  After Blog!! ')).toBe('after_blog');
+  });
+});
+
+describe('a variable with no sample value and no fallback is a placeholder pill in the live preview', () => {
+  const pillsIn = (el: Element) => Array.from(el.querySelectorAll('joryio-editor-preview[data-joryio-editor="var"]')) as HTMLElement[];
+
+  it('the pill shows the field name inside its own shadow root, never as page text', async () => {
+    const ed = started();
+    await deliver({ type: EDITOR_SESSION_MESSAGES.CONTEXT, attributes: [{ name: 'firstName' }, { name: 'city', custom: true }] });
+    const h2 = document.querySelector('h2')!;
+    ed.select(h2);
+    type($('text')!, 'Hi');
+    click($$('chip')[1]);
+    expect(textValue()).toBe('Hi {{ user.custom.city }}');
+    const pills = pillsIn(h2);
+    expect(pills).toHaveLength(1);
+    expect(pills[0].shadowRoot!.querySelector('.v')!.textContent).toBe('city');
+    expect(pills[0].shadowRoot!.querySelector('.v')!.getAttribute('dir')).toBe('auto');
+    expect(pills[0].getAttribute('style')).toContain('display:inline !important');
+    expect(pills[0].getAttribute('style')).toContain('unicode-bidi:isolate');
+    // Not page text: the element's own text has no name and no brackets.
+    expect(h2.textContent).toBe('Hi ');
+    expect(h2.textContent).not.toContain('[city]');
+    // A custom element, so the site's :nth-of-type selectors (and the editor's own) do not move.
+    expect(h2.querySelectorAll('span')).toHaveLength(0);
+    expect(robustSelector(document.querySelectorAll('section')[1])).toBe('body > main > section:nth-of-type(2)');
+    // The saved edit is unchanged Liquid; cancel / stop restore the page.
+    click($('save')!);
+    expect(picks().at(-1).value).toBe('Hi {{ user.custom.city }}');
+    ed.stop();
+    expect(document.querySelector('joryio-editor-preview')).toBeNull();
+    expect(h2.textContent).toBe('One');
+  });
+
+  it('with a sample value the value shows, with only a fallback the fallback (no pill)', async () => {
+    const ed = started();
+    await deliver({ type: EDITOR_SESSION_MESSAGES.CONTEXT, sample: { 'user.firstName': 'Lior' } });
+    const [one, two] = Array.from(document.querySelectorAll('h2'));
+    ed.pick(one, 'section:nth-of-type(1) h2', 'replace_text', 'Hi {{ user.firstName }}');
+    ed.pick(two, 'section:nth-of-type(2) h2', 'replace_text', 'Hi {{ user.lastName | default: "friend" }}');
+    expect(one.textContent).toBe('Hi Lior');
+    expect(two.textContent).toBe('Hi friend');
+    expect(pillsIn(document.body)).toHaveLength(0);
+  });
+
+  it('a right-to-left page: the pill is its own bidi island', async () => {
+    const ed = started();
+    await deliver({ type: EDITOR_SESSION_MESSAGES.CONTEXT, dir: 'rtl' });
+    const p = document.querySelector('p')!;
+    p.setAttribute('dir', 'rtl');
+    ed.pick(p, 'section:nth-of-type(2) > p:nth-of-type(1)', 'replace_text', 'שלום {{ user.firstName }}!');
+    expect(p.textContent).toBe('שלום !');
+    const pill = pillsIn(p)[0];
+    expect(pill.previousSibling!.textContent).toBe('שלום ');
+    expect(pill.nextSibling!.textContent).toBe('!');
+    expect(pill.getAttribute('style')).toContain('unicode-bidi:isolate');
+    expect(pill.shadowRoot!.querySelector('.v')!.getAttribute('dir')).toBe('auto');
+  });
+
+  it('a click on a pill selects the element it is in and never reaches the site', () => {
+    const ed = started();
+    const a = document.querySelector('a')!;
+    ed.pick(a, 'main > a', 'replace_text', 'Go {{ user.firstName }}');
+    const pill = pillsIn(a)[0];
+    const ev = new MouseEvent('click', { bubbles: true, cancelable: true });
+    pill.dispatchEvent(ev);
+    expect(ev.defaultPrevented).toBe(true);
+    expect($('title')!.textContent).toBe('Link "Link"');
+  });
+
+  it('the visitor runtime is unchanged: no pill code reaches the core bundle', () => {
+    const fs = require('fs');
+    const path = require('path');
+    const core = fs.readdirSync(path.join(__dirname, '../core')).filter((f: string) => f.endsWith('.ts') && !f.endsWith('.spec.ts'));
+    for (const f of core) {
+      const src = fs.readFileSync(path.join(__dirname, '../core', f), 'utf8');
+      expect(src).not.toMatch(/previewParts|PREVIEW_VAR_HOST_STYLE|from '\.\.\/editor/);
+    }
+  });
+});
+
+describe('the New text field shows variables as pills, and stores the same Liquid', () => {
+  const box = () => $('text')!;
+  const pillEls = () => Array.from(box().querySelectorAll('[data-liquid]')) as HTMLElement[];
+  // jsdom keeps no selection inside a shadow root; this stands in for Chromium's shadowRoot.getSelection().
+  let range: Range | null = null;
+  const select = (r: Range) => {
+    range = r;
+    (editor!.root as any).getSelection = () => ({ rangeCount: range ? 1 : 0, getRangeAt: () => range, removeAllRanges: () => (range = null), addRange: (x: Range) => (range = x) });
+  };
+  const caretAt = (node: Node, offset: number) => {
+    const r = document.createRange();
+    r.setStart(node, offset);
+    r.collapse(true);
+    select(r);
+  };
+  const open = async (ctx: Record<string, unknown> = {}) => {
+    const ed = started();
+    await deliver({ type: EDITOR_SESSION_MESSAGES.CONTEXT, attributes: [{ name: 'firstName' }, { name: 'city', custom: true }], ...ctx });
+    ed.select(document.querySelector('h2')!);
+    return ed;
+  };
+
+  it('an Insert chip puts an atomic pill in the field; the field emits the same string as before', async () => {
+    await open();
+    type(box(), 'Picked for you,');
+    click($$('chip')[0]);
+    expect(box().tagName).toBe('DIV');
+    expect(box().getAttribute('contenteditable')).toBe('true');
+    const [p] = pillEls();
+    expect(p.textContent).toBe('firstName');
+    expect(p.getAttribute('contenteditable')).toBe('false');
+    expect(p.getAttribute('data-liquid')).toBe('{{ user.firstName }}');
+    expect(textValue()).toBe('Picked for you, {{ user.firstName }}');
+    setPillFallback(0, 'friend');
+    expect(textValue()).toBe('Picked for you, {{ user.firstName | default: "friend" }}');
+    expect(pillEls()).toHaveLength(1);
+    expect(pillEls()[0].textContent).toBe('firstName · friend');
+    click($('save')!);
+    expect(picks().at(-1).value).toBe('Picked for you, {{ user.firstName | default: "friend" }}');
+  });
+
+  it('a chip inserts at the caret', async () => {
+    await open();
+    type(box(), 'Hello there');
+    caretAt(box().firstChild!, 5);
+    click($$('chip')[1]);
+    expect(textValue()).toBe('Hello {{ user.custom.city }} there');
+    expect(pillEls()).toHaveLength(1);
+  });
+
+  it('Backspace after a pill (and Delete before one) removes the whole pill', async () => {
+    await open();
+    type($('text')!, 'Hi');
+    click($$('chip')[0]);
+    box().appendChild(document.createTextNode('!'));
+    box().dispatchEvent(new Event('input'));
+    expect(textValue()).toBe('Hi {{ user.firstName }}!');
+    caretAt(box().lastChild!, 0); // between the pill and "!"
+    const ev = new KeyboardEvent('keydown', { key: 'Backspace', bubbles: true, cancelable: true });
+    box().dispatchEvent(ev);
+    expect(ev.defaultPrevented).toBe(true);
+    expect(pillEls()).toHaveLength(0);
+    expect(textValue()).toBe('Hi !');
+    // Delete, with the caret right before a pill.
+    click($$('chip')[0]);
+    caretAt(box(), Array.from(box().childNodes).indexOf(pillEls()[0]));
+    box().dispatchEvent(new KeyboardEvent('keydown', { key: 'Delete', bubbles: true, cancelable: true }));
+    expect(pillEls()).toHaveLength(0);
+    // Enter adds no line or markup.
+    const enter = new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true });
+    box().dispatchEvent(enter);
+    expect(enter.defaultPrevented).toBe(true);
+  });
+
+  it('copy puts the Liquid on the clipboard; paste is plain text and its Liquid becomes pills', async () => {
+    await open();
+    type(box(), 'Hi');
+    click($$('chip')[0]);
+    const r = document.createRange();
+    r.selectNodeContents(box());
+    select(r);
+    const data: Record<string, string> = {};
+    const copy = Object.assign(new Event('copy', { cancelable: true }), { clipboardData: { setData: (k: string, v: string) => (data[k] = v), getData: () => '' } });
+    box().dispatchEvent(copy);
+    expect(data['text/plain']).toBe('Hi {{ user.firstName }}');
+    caretAt(box(), box().childNodes.length);
+    const paste = Object.assign(new Event('paste', { cancelable: true }), { clipboardData: { getData: () => ' and {{ user.custom.city | default: "you" }}' } });
+    box().dispatchEvent(paste);
+    expect(textValue()).toBe('Hi {{ user.firstName }} and {{ user.custom.city | default: "you" }}');
+    expect(pillEls().map((p) => p.textContent)).toEqual(['firstName', 'city · you']);
+  });
+
+  it('"Liquid code" shows the raw text; editing it redraws the pills, byte for byte', async () => {
+    await open();
+    expect($('liquid')).toBeNull();
+    click($('liquid-toggle')!);
+    const liquid = 'Hi {{user.firstName|default:\'x\'}}, from {{ user.custom.city }}!';
+    type($('liquid')!, liquid);
+    expect(pillEls().map((p) => p.textContent)).toEqual(['firstName · x', 'city']);
+    expect(textValue()).toBe(liquid);
+    // A new variable has no fallback of its own: the other pill's stays on that pill.
+    click($$('chip')[0]);
+    expect(($('liquid') as HTMLTextAreaElement).value).toBe(`${liquid} {{ user.firstName }}`);
+    click($('save')!);
+    expect(picks().at(-1).value).toBe(`${liquid} {{ user.firstName }}`);
+  });
+
+  it('Liquid a pill cannot show keeps the field raw text with a note, and nothing is lost', async () => {
+    await open();
+    click($('liquid-toggle')!);
+    for (const raw of ['{% if user.vip %}VIP{% endif %} hi', 'Hi {{ user.firstName | upcase }}', 'Hi {{ "x" }}']) {
+      type($('liquid')!, raw);
+      expect(box().tagName).toBe('TEXTAREA');
+      expect(textValue()).toBe(raw);
+      expect($('raw-note')!.textContent).toContain('Shown as code');
+    }
+    type(box(), 'Hi {% if x %}y{% endif %}');
+    click($('save')!);
+    expect(picks().at(-1).value).toBe('Hi {% if x %}y{% endif %}');
+    // Back to a simple text: pills again.
+    const ed = editor!;
+    ed.select(document.querySelectorAll('h2')[1]);
+    expect($('liquid')).not.toBeNull(); // the Liquid code section stays open
+    type($('liquid')!, 'Yo {{ user.firstName }}');
+    expect(box().tagName).toBe('DIV');
+    expect($('raw-note')).toBeNull();
+  });
+
+  it('right-to-left: the field follows the text direction, a pill is isolated', async () => {
+    await open({ dir: 'rtl' });
+    type(box(), 'שלום');
+    click($$('chip')[0]);
+    expect(editor!.root!.querySelector('.r')!.getAttribute('dir')).toBe('rtl');
+    expect(box().getAttribute('dir')).toBe('auto');
+    expect(pillEls()[0].getAttribute('dir')).toBe('auto'); // a Hebrew label reads right, isolated from the text around it
+    expect(textValue()).toBe('שלום {{ user.firstName }}');
+    expect((editor!.root!.querySelector('style')!.textContent || '')).toMatch(/\.vp\{[^}]*unicode-bidi:isolate/);
+  });
+
+  it('the model: parts, previews and the raw fallback', () => {
+    expect(liquidParts('Hi {{ user.firstName }}!')).toEqual(['Hi ', { name: 'firstName', path: 'user.firstName', src: '{{ user.firstName }}' }, '!']);
+    expect(liquidParts('{{ user.custom.city | default: "x" }}')).toEqual([{ name: 'city', path: 'user.custom.city', src: '{{ user.custom.city | default: "x" }}' }]);
+    expect(liquidParts('{% if a %}b{% endif %}')).toBeNull();
+    expect(liquidParts('{{ user.a | upcase }}')).toBeNull();
+    expect(liquidParts('a }} b')).toBeNull();
+    expect(previewParts('Hi {{ user.firstName }} {{ user.a | default: "x" }}', {})).toEqual(['Hi ', { name: 'firstName', path: 'user.firstName', src: '{{ user.firstName }}' }, ' x']);
+  });
+});
+
+describe('selecting an element that already has an edit opens that edit', () => {
+  it('edit, select another element, select it again: its value, "Was:" the original, Save updates the same edit', () => {
+    const ed = started();
+    const h2 = document.querySelector('h2')!;
+    ed.select(h2);
+    type($('text')!, 'One 123');
+    click($('save')!);
+    const id = picks().at(-1).id;
+    expect(h2.textContent).toBe('One 123');
+    ed.select(document.querySelector('p')!);
+    click($('cancel')!);
+    h2.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+    expect(textValue()).toBe('One 123');
+    expect($('fields')!.textContent).toContain('Was: "One"');
+    expect($('title')!.textContent).toBe('Heading "One"');
+    type($('text')!, 'One 456');
+    click($('save')!);
+    expect(picks().at(-1)).toMatchObject({ id, value: 'One 456', text: 'One' });
+    expect(ed.editList()).toHaveLength(1);
+  });
+
+  it('arrow up / down onto an edited element opens its edit', () => {
+    const ed = started();
+    const h2 = document.querySelectorAll('h2')[1];
+    ed.select(h2);
+    type($('text')!, 'Two!');
+    click($('save')!);
+    ed.select(document.querySelectorAll('section')[1]);
+    expect($('action-text')!.getAttribute('aria-checked')).toBe('true');
+    key('ArrowDown');
+    expect(textValue()).toBe('Two!');
+    expect($('fields')!.textContent).toContain('Was: "Two"');
+  });
+
+  it('an edit from the dashboard opens on a click, with its fallback, and saves under its id', async () => {
+    const ed = started();
+    await deliver({ type: EDITOR_SESSION_MESSAGES.CONTEXT, edits: [{ id: 'e1', selector: 'section:nth-of-type(1) h2', operation: 'replace_text', value: 'Hi {{ user.firstName | default: "you" }}' }] });
+    const h2 = document.querySelector('h2')!;
+    expect(h2.textContent).toBe('Hi you');
+    ed.select(h2);
+    expect(textValue()).toBe('Hi {{ user.firstName | default: "you" }}');
+    expect(pills()[0].textContent).toBe('firstName · you');
+    expect($('fields')!.textContent).toContain('Was: "One"');
+    setPillFallback(0, 'there');
+    click($('save')!);
+    expect(picks().at(-1)).toMatchObject({ id: 'e1', value: 'Hi {{ user.firstName | default: "there" }}' });
+    expect(ed.editList()).toHaveLength(1);
+  });
+
+  it('an element with several edits opens the latest; its tiles switch between them, a new kind is a new edit', () => {
+    const ed = started();
+    const btn = document.querySelector('[data-testid=buy]') as HTMLElement;
+    ed.select(btn);
+    type($('text')!, 'Buy now');
+    click($('save')!);
+    const textId = picks().at(-1).id;
+    ed.select(btn);
+    click($('action-slot')!);
+    type($('slot-name')!, 'promo');
+    click($('save')!);
+    const slotId = picks().at(-1).id;
+    expect(slotId).not.toBe(textId);
+    expect(ed.editList()).toHaveLength(2); // the text edit was kept
+    ed.select(btn);
+    expect($('action-slot')!.getAttribute('aria-checked')).toBe('true');
+    expect(($('slot-name') as HTMLInputElement).value).toBe('promo');
+    expect($('action-text')!.hasAttribute('data-e')).toBe(true);
+    expect($('action-hide')!.hasAttribute('data-e')).toBe(false);
+    click($('action-text')!);
+    expect(textValue()).toBe('Buy now');
+    type($('text')!, 'Buy today');
+    click($('save')!);
+    expect(picks().at(-1)).toMatchObject({ id: textId, operation: 'replace_text', value: 'Buy today', text: 'Buy' });
+    expect(ed.editList().map((e) => e.id)).toEqual([textId, slotId]);
+  });
+});
+
+describe('the personalization catalog: a few chips, and "More…" for the rest', () => {
+  const catalog = [
+    { key: 'user.firstName', label: 'First name', group: 'Profile' },
+    { key: 'user.lastName', label: 'Last name', group: 'Profile' },
+    { key: 'user.email', label: 'Email', group: 'Profile' },
+    { key: 'user.custom.city', label: 'City', group: 'Custom attributes' },
+    { key: 'user.custom.loyalty_tier', label: 'Loyalty tier', group: 'Custom attributes' },
+    { key: 'user.custom.bad key', label: 'bad key', group: 'x' },
+    { key: 'user.custom.favorite_color', label: 'צבע אהוב', group: 'Custom attributes' },
+  ];
+  const open = async (attributes: unknown[], dir = 'ltr') => {
+    const ed = started();
+    await deliver({ type: EDITOR_SESSION_MESSAGES.CONTEXT, attributes, dir });
+    ed.select(document.querySelector('h2')!);
+    type($('text')!, 'Hi');
+    return ed;
+  };
+  const keydown = (el: HTMLElement, k: string) => el.dispatchEvent(new KeyboardEvent('keydown', { key: k, bubbles: true, cancelable: true }));
+
+  it('the older { name, custom } shape still works, with no More button for a short list', async () => {
+    await open([{ name: 'firstName' }, { name: 'city', custom: true }]);
+    expect($$('chip').map((c) => c.textContent)).toEqual(['firstName', 'city']);
+    expect($('more')).toBeNull();
+    click($$('chip')[1]);
+    expect(textValue()).toBe('Hi {{ user.custom.city }}');
+  });
+
+  it('the catalog shape: the common fields as chips (labels), the rest grouped and searchable', async () => {
+    await open(catalog);
+    expect($$('chip').map((c) => c.textContent)).toEqual(['First name', 'Last name', 'Email', 'City']);
+    expect(($('var-picker') as HTMLElement).hidden).toBe(true);
+    click($('more')!);
+    expect(($('var-picker') as HTMLElement).hidden).toBe(false);
+    expect($('more')!.getAttribute('aria-expanded')).toBe('true');
+    const list = $('var-list')!;
+    expect(Array.from(list.children).map((c) => c.textContent)).toEqual([
+      'Profile',
+      'First nameuser.firstName',
+      'Last nameuser.lastName',
+      'Emailuser.email',
+      'Custom attributes',
+      'Cityuser.custom.city',
+      'Loyalty tieruser.custom.loyalty_tier',
+      'צבע אהובuser.custom.favorite_color',
+    ]); // the invalid key was dropped
+    type($('var-search')!, 'loyal');
+    expect($$('var-option').map((o) => o.textContent)).toEqual(['Loyalty tieruser.custom.loyalty_tier']);
+    type($('var-search')!, 'zzz');
+    expect($('var-list')!.textContent).toBe('No matching fields');
+  });
+
+  it('inserting from the picker gives the same Liquid as a chip, as a pill with the label', async () => {
+    await open(catalog);
+    click($$('chip')[3]);
+    const viaChip = textValue();
+    type($('text')!, 'Hi');
+    click($('more')!);
+    type($('var-search')!, 'city');
+    click($$('var-option')[0]);
+    expect(textValue()).toBe(viaChip);
+    expect(textValue()).toBe('Hi {{ user.custom.city }}');
+    expect(($('var-picker') as HTMLElement).hidden).toBe(true);
+    expect($('text')!.querySelector('[data-liquid]')!.textContent).toBe('City');
+    // The page preview's pill shows the label too.
+    const pill = document.querySelector('h2 joryio-editor-preview') as HTMLElement;
+    expect(pill.shadowRoot!.querySelector('.v')!.textContent).toBe('City');
+  });
+
+  it('the keyboard: down / up move, Enter inserts, Esc closes the picker and not the panel; RTL', async () => {
+    await open(catalog, 'rtl');
+    click($('more')!);
+    const search = $('var-search')!;
+    keydown(search, 'ArrowDown');
+    keydown(search, 'ArrowDown');
+    expect($$('var-option')[2].getAttribute('aria-selected')).toBe('true');
+    expect(search.getAttribute('aria-activedescendant')).toBe('jv2');
+    keydown(search, 'ArrowUp');
+    keydown(search, 'Enter');
+    expect(textValue()).toBe('Hi {{ user.lastName }}');
+    click($('more')!);
+    search.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true, composed: true }));
+    expect(($('var-picker') as HTMLElement).hidden).toBe(true);
+    expect($('panel')).not.toBeNull();
+    // RTL: the labels follow their own direction, the paths stay left-to-right.
+    click($('more')!);
+    const opt = $$('var-option').filter((o) => o.textContent!.startsWith('צבע'))[0];
+    expect(opt.querySelector('span')!.getAttribute('dir')).toBe('auto');
+    expect(opt.querySelector('code')!.getAttribute('dir')).toBe('ltr');
+    expect(editor!.root!.querySelector('.r')!.getAttribute('dir')).toBe('rtl');
+  });
+});
+
+describe('each variable has its own fallback (a click on its pill)', () => {
+  const open = async (ctx: Record<string, unknown> = {}) => {
+    const ed = started();
+    await deliver({ type: EDITOR_SESSION_MESSAGES.CONTEXT, attributes: [{ name: 'firstName' }, { name: 'city', custom: true }], ...ctx });
+    ed.select(document.querySelector('h2')!);
+    return ed;
+  };
+
+  it('the panel has no single "If a value is missing" field; a pill opens "If <field> is missing" for that variable only', async () => {
+    await open();
+    type($('text')!, 'Hi');
+    expect($('fallback')).toBeNull();
+    click($$('chip')[0]);
+    click($$('chip')[1]);
+    expect($('fallback')).toBeNull(); // nothing until a pill is clicked
+    click(pills()[1]);
+    expect($('fallback-pop')!.getAttribute('role')).toBe('dialog');
+    expect($('fallback-pop')!.textContent).toContain('If city is missing');
+    type($('fallback')!, 'your city');
+    expect(textValue()).toBe('Hi {{ user.firstName }} {{ user.custom.city | default: "your city" }}');
+    expect(pills().map((p) => p.textContent)).toEqual(['firstName', 'city · your city']);
+  });
+
+  it('two variables, two different fallbacks; the Liquid is the dashboard format', async () => {
+    await open();
+    type($('text')!, 'Hi');
+    click($$('chip')[0]);
+    click($$('chip')[1]);
+    setPillFallback(0, 'friend');
+    setPillFallback(1, 'your town');
+    expect(textValue()).toBe('Hi {{ user.firstName | default: "friend" }} {{ user.custom.city | default: "your town" }}');
+    // Clearing one removes only that default.
+    setPillFallback(0, '');
+    expect(textValue()).toBe('Hi {{ user.firstName }} {{ user.custom.city | default: "your town" }}');
+    click($('save')!);
+    expect(picks().at(-1).value).toBe('Hi {{ user.firstName }} {{ user.custom.city | default: "your town" }}');
+  });
+
+  it('an existing edit loads each default on its own pill (the old single field wrote it on one variable)', async () => {
+    const ed = started();
+    const old = 'Hi {{ user.firstName | default: "you" }}, from {{ user.custom.city }}';
+    await deliver({ type: EDITOR_SESSION_MESSAGES.CONTEXT, edits: [{ id: 'e1', selector: 'section:nth-of-type(1) h2', operation: 'replace_text', value: old }] });
+    ed.select(document.querySelector('h2')!);
+    expect(textValue()).toBe(old); // byte for byte
+    expect(pills().map((p) => p.textContent)).toEqual(['firstName · you', 'city']);
+    click(pills()[0]);
+    expect(($('fallback') as HTMLInputElement).value).toBe('you');
+  });
+
+  it('quotes: "..." by default, \'...\' around a double quote, both kinds keep the text (apostrophe as U+2019)', async () => {
+    expect(quoted('friend')).toBe('"friend"');
+    expect(quoted('the "best"')).toBe("'the \"best\"'");
+    expect(quoted('it\'s "ok"')).toBe('\'it’s "ok"\'');
+    await open();
+    type($('text')!, 'Hi');
+    click($$('chip')[0]);
+    setPillFallback(0, 'my "friend"');
+    expect(textValue()).toBe("Hi {{ user.firstName | default: 'my \"friend\"' }}");
+    expect(pills()[0].textContent).toBe('firstName · my "friend"');
+    // The pill box still reads it back as one pill.
+    click($('liquid-toggle')!);
+    expect(pills()).toHaveLength(1);
+  });
+
+  it('a fallback with Liquid in it is refused, the text keeps the last plain one', async () => {
+    expect(isPlainFallback('friend')).toBe(true);
+    expect(isPlainFallback('{{ user.x }}')).toBe(false);
+    expect(isPlainFallback('{% if %}')).toBe(false);
+    await open();
+    type($('text')!, 'Hi');
+    click($$('chip')[0]);
+    setPillFallback(0, 'pal');
+    type($('fallback')!, 'pal {{ user.email }}');
+    expect($('fallback-error')!.textContent).toBe('Plain text only - no Liquid here.');
+    expect(textValue()).toBe('Hi {{ user.firstName | default: "pal" }}');
+  });
+
+  it('Esc closes the popover and not the panel; Enter closes it; Enter on a focused pill opens it', async () => {
+    await open();
+    type($('text')!, 'Hi');
+    click($$('chip')[0]);
+    click(pills()[0]);
+    document.body.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }));
+    expect($('fallback-pop')).toBeNull();
+    expect($('panel')).not.toBeNull();
+    const p = pills()[0];
+    expect(p.getAttribute('tabindex')).toBe('0');
+    expect(p.getAttribute('role')).toBe('button');
+    p.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }));
+    expect($('fallback-pop')).not.toBeNull();
+    $('fallback')!.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }));
+    expect($('fallback-pop')).toBeNull();
+  });
+
+  it('RTL: the popover is in the panel flow, its input follows the text direction', async () => {
+    await open({ dir: 'rtl', strings: { fallbackFor: 'אם {name} חסר' } });
+    type($('text')!, 'שלום');
+    click($$('chip')[0]);
+    click(pills()[0]);
+    expect($('fallback-pop')!.textContent).toContain('אם firstName חסר');
+    expect($('fallback')!.getAttribute('dir')).toBe('auto');
+    expect($('text-box')!.contains($('fallback-pop'))).toBe(true);
+  });
+
+  it('the live preview: each variable its own sample, else its own fallback, else the placeholder pill', async () => {
+    expect(previewText('{{ user.firstName | default: "a" }} {{ user.lastName | default: "b" }} {{ user.custom.city }}', { 'user.firstName': 'Lior' })).toBe('Lior b [city]');
+    await open({ sample: { 'user.firstName': 'Lior' } });
+    const h2 = document.querySelector('h2')!;
+    type($('text')!, 'Hi');
+    click($$('chip')[0]);
+    click($$('chip')[1]);
+    setPillFallback(1, 'there');
+    expect(h2.textContent).toBe('Hi Lior there');
+    setPillFallback(0, 'friend'); // a sample beats the fallback
+    expect(h2.textContent).toBe('Hi Lior there');
+    setPillFallback(1, '');
+    expect(h2.textContent).toBe('Hi Lior '); // city: neither sample nor fallback - a pill (not page text)
+    expect(h2.querySelectorAll('joryio-editor-preview[data-joryio-editor="var"]')).toHaveLength(1);
+  });
+});
+
+describe('a saved content slot: its campaigns, or "Create content for this slot"', () => {
+  const openSlots = () => posted.map((p) => p.msg).filter((m) => m.type === EDITOR_SESSION_MESSAGES.OPEN_SLOT);
+  const addSlot = (ed: VisualEditor, name: string) => {
+    ed.select(document.querySelector('#hero') as HTMLElement);
+    click($('action-slot')!);
+    type($('slot-name')!, name);
+    click($('save')!);
+  };
+
+  it('a slot with no campaign: the button, and a click posts { placementKey } and focuses the dashboard', async () => {
+    const ed = started();
+    await deliver({ type: EDITOR_SESSION_MESSAGES.CONTEXT, openSlot: true, placements: [{ key: 'home_hero', name: 'Home hero', campaigns: [] }] });
+    addSlot(ed, 'After Blog');
+    expect(picks().at(-1)).toMatchObject({ operation: 'insert_placement', placementKey: 'after_blog' });
+    // The panel stays open on the saved slot.
+    expect($('panel')).not.toBeNull();
+    expect($('slot-create')!.textContent).toBe('Create content for this slot →');
+    expect($('slot-campaign')).toBeNull();
+    click($('slot-create')!);
+    expect(openSlots()).toEqual([{ type: 'joryio:editor-open-slot', placementKey: 'after_blog' }]);
+    expect(posted.at(-1)!.origin).toBe(DASHBOARD);
+    expect(opener.focus).toHaveBeenCalled();
+  });
+
+  it('a slot with campaigns: "In this slot: <name> (status)", each opens its campaign; "+ Add another campaign"', async () => {
+    const ed = started();
+    await deliver({
+      type: EDITOR_SESSION_MESSAGES.CONTEXT,
+      openSlot: true,
+      placements: [{ key: 'home_hero', campaigns: [{ id: 'c-1', name: 'Winter sale', status: 'active', statusLabel: 'Active' }, { id: 'c-2', name: 'Draft promo', status: 'draft' }, { id: 'bad id!', name: 'x', status: 'x' }] }],
+    });
+    addSlot(ed, 'home_hero');
+    expect($('slot-content')!.textContent).toContain('In this slot:');
+    expect($$('slot-campaign').map((b) => b.textContent)).toEqual(['Winter sale (Active)', 'Draft promo (draft)']);
+    click($$('slot-campaign')[1]);
+    click($('slot-add')!);
+    expect(openSlots()).toEqual([
+      { type: 'joryio:editor-open-slot', placementKey: 'home_hero', campaignId: 'c-2' },
+      { type: 'joryio:editor-open-slot', placementKey: 'home_hero' },
+    ]);
+  });
+
+  it('opening an existing slot edit shows the same; the key as saved, not as being typed', async () => {
+    const ed = started();
+    await deliver({
+      type: EDITOR_SESSION_MESSAGES.CONTEXT,
+      openSlot: true,
+      edits: [{ id: 'e9', selector: '#hero', operation: 'insert_placement', placementKey: 'home_hero', position: 'after' }],
+      placements: [{ key: 'home_hero', campaigns: [{ id: 'c-1', name: 'Winter sale', status: 'active' }] }],
+    });
+    ed.select(document.querySelector('#hero') as HTMLElement);
+    expect($$('slot-campaign').map((b) => b.textContent)).toEqual(['Winter sale (active)']);
+    type($('slot-name')!, 'other');
+    click($$('slot-campaign')[0]);
+    expect(openSlots().at(-1)).toEqual({ type: 'joryio:editor-open-slot', placementKey: 'home_hero', campaignId: 'c-1' });
+  });
+
+  it('a new, unsaved slot shows nothing yet', async () => {
+    const ed = started();
+    await deliver({ type: EDITOR_SESSION_MESSAGES.CONTEXT, openSlot: true });
+    ed.select(document.querySelector('#hero') as HTMLElement);
+    click($('action-slot')!);
+    type($('slot-name')!, 'promo');
+    expect($('slot-content')).toBeNull();
+  });
+
+  it('the older context (beta.6 dashboard: placements without campaigns, no openSlot): the slot saves and closes as before, no shortcut', async () => {
+    const ed = started();
+    await deliver({ type: EDITOR_SESSION_MESSAGES.CONTEXT, placements: [{ key: 'home_hero', name: 'Home hero' }] });
+    expect($('slot-name')).toBeNull();
+    ed.select(document.querySelector('#hero') as HTMLElement);
+    click($('action-slot')!);
+    expect($$('placement').map((c) => c.textContent)).toEqual(['home_hero']); // the chips still work
+    click($$('placement')[0]);
+    click($('save')!);
+    expect(picks().at(-1)).toMatchObject({ placementKey: 'home_hero' });
+    expect($('panel')).toBeNull();
+    ed.select(document.querySelector('#hero') as HTMLElement);
+    expect($('slot-content')).toBeNull();
+    expect(ed.openSlot('home_hero')).toBe(false);
+    expect(openSlots()).toEqual([]);
   });
 });

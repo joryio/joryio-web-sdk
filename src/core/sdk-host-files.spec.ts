@@ -43,6 +43,18 @@ describe('lazily loaded files come from the core\'s own folder', () => {
     ]);
   });
 
+  it('a beta build (SDK_VERSION stamped 1.4.0-beta.6): its own folder on the SDK host, never the major channel', () => {
+    // npm beta bundled into a site or served from a CDN: the beta's folder only (web/1/ holds the previous final).
+    expect(sdkHostFileUrls('joryio-cards-ui.min.js', undefined, null, '1.4.0-beta.6')).toEqual([host('1.4.0-beta.6', 'joryio-cards-ui.min.js')]);
+    expect(sdkHostFileUrls('joryio-editor.min.js', undefined, 'https://cdn.jsdelivr.net/npm/@joryio/web-sdk@1.4.0-beta.6/dist/', '1.4.0-beta.6')).toEqual([
+      'https://cdn.jsdelivr.net/npm/@joryio/web-sdk@1.4.0-beta.6/dist/joryio-editor.min.js',
+      host('1.4.0-beta.6', 'joryio-editor.min.js'),
+    ]);
+    expect(sdkHostFileUrls('joryio-editor.min.js', undefined, host('1.4.0-beta.6', ''), '1.4.0-beta.6')).toEqual([host('1.4.0-beta.6', 'joryio-editor.min.js')]);
+    // A final keeps the channel as the last resort.
+    expect(sdkHostFileUrls('joryio-editor.min.js', undefined, null, '1.4.0')).toEqual([host('1.4.0', 'joryio-editor.min.js'), host('1', 'joryio-editor.min.js')]);
+  });
+
   it('bundled (no own folder): the SDK host as before; an init option replaces everything', () => {
     expect(sdkHostFileUrls('joryio-editor.min.js', undefined, null)).toEqual([host(SDK_VERSION, 'joryio-editor.min.js'), host(MAJOR, 'joryio-editor.min.js')]);
     expect(sdkHostFileUrls('joryio-editor.min.js', 'https://cdn.shop.example/e.js', 'https://sdk.joryio.com/web/1.4.0-beta.4/')).toEqual(['https://cdn.shop.example/e.js']);

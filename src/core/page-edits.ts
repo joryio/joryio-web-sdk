@@ -49,7 +49,8 @@ import { sdkIdentityHeaders } from './config';
 import { currentPageUrl, PAGE_CONTEXT_CAPABILITY, type PageContextTracker } from './page-context';
 
 export const PAGE_EDIT_OPERATIONS = ['replace_text', 'replace_image', 'replace_link', 'hide', 'insert_placement'] as const;
-export const PAGE_EDIT_POSITIONS = ['before', 'after', 'prepend', 'append'] as const;
+/** `replace` ("Instead of it"): the element is hidden and the spot takes its place, right after it. */
+export const PAGE_EDIT_POSITIONS = ['before', 'after', 'prepend', 'append', 'replace'] as const;
 export const PAGE_EDITS_CAPABILITY = 'page_edits';
 /** The longest edited elements stay hidden while the SDK waits. Never the whole body. */
 export const PAGE_EDIT_ANTI_FLICKER_MS = 300;
@@ -141,6 +142,32 @@ const safeRestoredSrcset = (v: unknown): string | null =>
   typeof v === 'string' && v.split(',').every((c) => !c.trim() || safeRestoredUrl(c.trim().split(/\s+/)[0]) !== null) ? v : null;
 
 const HIDE_DECLARATION = 'display:none !important';
+
+/** Hide one element (display:none !important); returns how to show it again as it was. */
+function hideElement(h: HTMLElement): () => void {
+  const display = h.style.getPropertyValue('display');
+  const priority = h.style.getPropertyPriority('display');
+  h.style.setProperty('display', 'none', 'important');
+  return () => (display ? h.style.setProperty('display', display, priority) : h.style.removeProperty('display'));
+}
+
+/**
+ * Undo a hide the server wrote (`hide`, and `insert_placement` at `replace`).
+ * Never a style string from the marker: the original is put back only when
+ * the attribute is exactly it plus the server's one declaration; otherwise
+ * that one declaration is removed.
+ */
+function undoServerHide(el: Element, orig: Record<string, any>): void {
+  const current = el.getAttribute('style') || '';
+  const before = typeof orig.style === 'string' ? orig.style : null;
+  const base = before === null ? '' : before.trim().replace(/;+$/, '');
+  if (current === (base ? base + ';' : '') + HIDE_DECLARATION) {
+    if (before === null) el.removeAttribute('style');
+    else el.setAttribute('style', before);
+  } else if ((el as HTMLElement).style?.getPropertyValue('display') === 'none') {
+    (el as HTMLElement).style.removeProperty('display');
+  }
+}
 
 /**
  * Inline text markup a replaced element's original content may come back with.
@@ -717,12 +744,8 @@ export class PageEditManager {
         el.setAttribute('href', edit.value!);
         return () => (href === null ? el.removeAttribute('href') : el.setAttribute('href', href));
       }
-      case 'hide': {
-        const display = h.style.getPropertyValue('display');
-        const priority = h.style.getPropertyPriority('display');
-        h.style.setProperty('display', 'none', 'important');
-        return () => (display ? h.style.setProperty('display', display, priority) : h.style.removeProperty('display'));
-      }
+      case 'hide':
+        return hideElement(h);
       case 'insert_placement': {
         const spot = document.createElement('div');
         spot.setAttribute('data-joryio-placement', edit.placementKey!);
@@ -730,7 +753,13 @@ export class PageEditManager {
         const where: InsertPosition =
           edit.position === 'before' ? 'beforebegin' : edit.position === 'prepend' ? 'afterbegin' : edit.position === 'append' ? 'beforeend' : 'afterend';
         el.insertAdjacentElement(where, spot);
-        return () => spot.remove();
+        if (edit.position !== 'replace') return () => spot.remove();
+        // "Instead of it": the spot sits where the element was, the element is hidden.
+        const show = hideElement(h);
+        return () => {
+          spot.remove();
+          show();
+        };
       }
       default:
         return null;
@@ -955,21 +984,13 @@ export class PageEditManager {
               else el.setAttribute('href', href);
             }
             break;
-          case 'hide': {
-            // Never a style string from the marker: the original is put back only when the
-            // attribute is exactly it plus the server's one declaration; otherwise that one
-            // declaration is removed.
-            const current = el.getAttribute('style') || '';
-            const before = typeof orig.style === 'string' ? orig.style : null;
-            const base = before === null ? '' : before.trim().replace(/;+$/, '');
-            if (current === (base ? base + ';' : '') + HIDE_DECLARATION) {
-              if (before === null) el.removeAttribute('style');
-              else el.setAttribute('style', before);
-            } else if ((el as HTMLElement).style?.getPropertyValue('display') === 'none') {
-              (el as HTMLElement).style.removeProperty('display');
-            }
+          case 'hide':
+            undoServerHide(el, orig);
             break;
-          }
+          case 'insert_placement':
+            // "Instead of it" also hid the element (the spot itself is removed below).
+            if (edit.position === 'replace') undoServerHide(el, orig);
+            break;
           default:
             break;
         }

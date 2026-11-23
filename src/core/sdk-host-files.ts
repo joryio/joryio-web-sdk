@@ -56,23 +56,28 @@ const OWN_FOLDER = readOwnFolder();
 /**
  * Where a lazily loaded file comes from, in order:
  *  1. the folder the core itself was loaded from (`coreFolderOf`), so a core
- *     from `sdk.joryio.com/web/1.4.0-beta.4/` (a beta, whose SDK_VERSION
- *     still says 1.4.0) or from the npm package's `dist/` on a CDN loads the
- *     side files of the same build - unless that folder is the major channel
- *     `sdk.joryio.com/web/<major>/`, which moves: then 2 goes first;
+ *     from `sdk.joryio.com/web/1.4.0-beta.6/` or from the npm package's
+ *     `dist/` on a CDN loads the side files of the same build - unless that
+ *     folder is the major channel `sdk.joryio.com/web/<major>/`, which moves:
+ *     then 2 goes first;
  *  2. the exact SDK version's folder on the SDK host (immutable, the same
- *     build as this core);
+ *     build as this core). A beta's SDK_VERSION is the beta's own version
+ *     (from 1.4.0-beta.6 the release build stamps it), so this is
+ *     `web/1.4.0-beta.6/`, the only folder a beta is published to;
  *  3. the major channel, as a fallback (a version not on the CDN, such as a
- *     local build).
+ *     local build) - never for a pre-release: the channel carries finals
+ *     only, so a beta would get the previous final's side files.
  * An init option (`editorScriptUrl`, `cardsUiScriptUrl`) replaces all of
  * them, for a self-hosted SDK.
  */
-export function sdkHostFileUrls(file: string, override?: string, ownFolder: string | null = OWN_FOLDER): string[] {
+export function sdkHostFileUrls(file: string, override?: string, ownFolder: string | null = OWN_FOLDER, version: string = SDK_VERSION): string[] {
   if (override) return [override];
-  const major = SDK_VERSION.split('.')[0];
-  const exact = `${SDK_HOST}/web/${SDK_VERSION}/${file}`;
+  const major = version.split('.')[0];
+  const exact = `${SDK_HOST}/web/${version}/${file}`;
   const channel = `${SDK_HOST}/web/${major}/${file}`;
-  const urls = ownFolder && ownFolder !== `${SDK_HOST}/web/${major}/` ? [`${ownFolder}${file}`, exact, channel] : [exact, channel];
+  const prerelease = version.includes('-');
+  let urls = ownFolder && ownFolder !== `${SDK_HOST}/web/${major}/` ? [`${ownFolder}${file}`, exact, channel] : [exact, channel];
+  if (prerelease) urls = urls.filter((u) => u !== channel);
   return urls.filter((u, i) => urls.indexOf(u) === i);
 }
 

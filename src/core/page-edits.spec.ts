@@ -58,7 +58,7 @@ const tracks = () => calls.filter((c) => c.path.endsWith('/v1/in-app/track')).ma
 describe('page edits', () => {
   it('pins the wire values (the backend pins the same list)', () => {
     expect(PAGE_EDIT_OPERATIONS).toEqual(['replace_text', 'replace_image', 'replace_link', 'hide', 'insert_placement']);
-    expect(PAGE_EDIT_POSITIONS).toEqual(['before', 'after', 'prepend', 'append']);
+    expect(PAGE_EDIT_POSITIONS).toEqual(['before', 'after', 'prepend', 'append', 'replace']);
     expect(PAGE_EDITS_CAPABILITY).toBe('page_edits');
     expect(PAGE_EDIT_ANTI_FLICKER_MS).toBe(300);
   });
@@ -100,6 +100,26 @@ describe('page edits', () => {
     // destroy undoes everything
     expect(document.querySelector('#hero h1')!.textContent).toBe('Welcome');
     expect(document.querySelector('img.hero')!.getAttribute('srcset')).toBe('https://cdn.example/a2.png 2x');
+    expect(document.querySelector('[data-joryio-placement]')).toBeNull();
+  });
+
+  it('"Instead of it" (position replace): the element is hidden, the spot takes its place, destroy puts it back', async () => {
+    (document.querySelector('.promo') as HTMLElement).style.setProperty('display', 'flex');
+    answer = () => ({
+      body: { success: true, experiences: [experience([{ id: 'r1', selector: '.promo', operation: 'insert_placement', placementKey: 'home_hero', position: 'replace' }])] },
+    });
+    expect(trustedEdit({ id: 'r1', selector: '.promo', operation: 'insert_placement', placementKey: 'home_hero', position: 'replace' })).toMatchObject({ position: 'replace' });
+    const m = make();
+    m.start();
+    await flush();
+    await flush();
+    const promo = document.querySelector('.promo') as HTMLElement;
+    expect(promo.style.getPropertyValue('display')).toBe('none');
+    expect(promo.style.getPropertyPriority('display')).toBe('important');
+    expect(promo.nextElementSibling!.getAttribute('data-joryio-placement')).toBe('home_hero');
+    expect(tracks()).toEqual([expect.objectContaining({ action: 'displayed', campaignId: 'c1' })]);
+    m.destroy();
+    expect(promo.style.getPropertyValue('display')).toBe('flex');
     expect(document.querySelector('[data-joryio-placement]')).toBeNull();
   });
 
@@ -597,6 +617,38 @@ describe('edits the server already applied (D450)', () => {
     m.destroy();
     // destroy undoes the SDK's own edit back to the page as the visitor got it
     expect(document.querySelector('#hero h1')!.innerHTML).toBe('Welcome <em>back</em>');
+  });
+
+  it('"Instead of it" written by the server: kept when the answer carries it, undone (element shown, spot removed) when not', async () => {
+    const REPLACE_EDIT = { id: 'e6', selector: '.promo', operation: 'insert_placement', placementKey: 'home_hero', position: 'replace' };
+    // The plugins' shared core's real output for this edit (Joryio_Server_Page_Edits::apply, php 8.2).
+    const page = () => {
+      document.open();
+      document.write("<!DOCTYPE html>\n<html><head><script type=\"application/json\" id=\"joryio-server-page-edits\">{\"v\":1,\"experiences\":[{\"id\":\"c1\",\"variantId\":\"A\",\"edits\":[{\"id\":\"e6\",\"selector\":\".promo\",\"operation\":\"insert_placement\",\"placementKey\":\"home_hero\",\"position\":\"replace\"}]}]}</script><title>Shop</title></head>\n<body>\n<div class=\"promo\" style=\"color:red;display:none !important\" data-joryio-applied=\"c1:e6\" data-joryio-orig=\"{&quot;c1:e6&quot;:{&quot;spot&quot;:&quot;replace&quot;,&quot;style&quot;:&quot;color:red&quot;}}\">Promo</div><div data-joryio-placement=\"home_hero\" data-joryio-edit=\"e6\" data-joryio-server-spot=\"c1:e6\"></div>\n</body>\n</html>\n");
+      document.close();
+    };
+    page();
+    answer = () => ({ body: { success: true, experiences: [experience([REPLACE_EDIT])] } });
+    let m = make();
+    m.start();
+    await flush();
+    await flush();
+    expect(m.serverAppliedCount()).toBe(1);
+    expect(m.appliedCount()).toBe(0);
+    expect(spots()).toBe(1);
+    expect((document.querySelector('.promo') as HTMLElement).style.display).toBe('none');
+    m.destroy();
+
+    page();
+    answer = () => ({ body: { success: true, experiences: [] } });
+    m = make();
+    m.start();
+    await flush();
+    await flush();
+    expect(document.querySelector('.promo')!.getAttribute('style')).toBe('color:red');
+    expect(spots()).toBe(0);
+    expect(document.querySelectorAll('[data-joryio-applied]').length).toBe(0);
+    m.destroy();
   });
 
   it('a control visitor (another variant than the cached page): undone, control_viewed reported', async () => {

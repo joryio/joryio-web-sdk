@@ -32,6 +32,7 @@
  *   only when `allowHtmlJsInAppMessages` is on.
  */
 
+import { JoryioSubscription, joryioSubscription } from './subscription';
 import { bucketHash } from '../utils/bucket-hash';
 import { currentPageUrl, PAGE_CONTEXT_CAPABILITY, type PageContextTracker } from './page-context';
 import { Logger } from '../utils/logger';
@@ -488,13 +489,15 @@ export class PlacementManager {
     await this.fetchKeys(wanted, true);
   }
 
-  /** Called with the placements that changed after each answer. Returns an unsubscribe. */
-  onPlacementsUpdated(callback: PlacementsUpdatedCallback): () => void {
-    if (typeof callback !== 'function') return () => undefined;
-    this.listeners.add(callback);
-    return () => {
-      this.listeners.delete(callback);
-    };
+  /** Called with the placements that changed after each answer. Returns a JoryioSubscription. */
+  onPlacementsUpdated(callback: PlacementsUpdatedCallback): JoryioSubscription {
+    if (typeof callback !== 'function') return joryioSubscription(() => undefined);
+    // One entry per subscription, so the same function subscribed twice is two subscriptions.
+    const entry: PlacementsUpdatedCallback = (placements) => callback(placements);
+    this.listeners.add(entry);
+    return joryioSubscription(() => {
+      this.listeners.delete(entry);
+    });
   }
 
   /** Mount every `[data-joryio-placement]` element on the page, now and as the page changes. */

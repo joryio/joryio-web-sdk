@@ -141,7 +141,15 @@ describe('FlagsManager (web)', () => {
     await settle(10);
     expect(seen.length).toBeGreaterThanOrEqual(2);
     expect(m.getBoolFlag('new_checkout', false)).toBe(true);
+    // A JoryioSubscription: cancel() stops it, calling it is the same, twice is harmless.
+    expect(typeof off.cancel).toBe('function');
+    off.cancel();
     off();
+    const count = seen.length;
+    setUser('customer-3');
+    m.onIdentityChanged();
+    await settle(10);
+    expect(seen.length).toBe(count);
   });
 
   it('exposures read as A are sent as A after identify(B), never as B', async () => {

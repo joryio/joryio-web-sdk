@@ -23,6 +23,7 @@ import { UTMManager } from './utm';
 import { InAppMessagingManager, InAppCampaign } from './inapp';
 import { PlacementManager, Placement, PlacementHandle, InsertPlacementOptions, PlacementsUpdatedCallback, PlacementConsent } from './placements';
 import { CardManager, Card, CardFeed, CardFeedHandle, CardsUpdatedCallback, GetCardsOptions, MountCardFeedOptions } from './cards';
+import { JoryioSubscription, joryioSubscription } from './subscription';
 import { LinkRouter, JoryioLinkHandler } from './links';
 import { FlagsManager, FlagsUpdatedCallback } from './flags';
 import { User } from './user';
@@ -3483,11 +3484,11 @@ export class JoryioSDK {
     await this.placements.refreshPlacements(placementKeys);
   }
 
-  /** Called with the placements whose content changed. Returns an unsubscribe function. */
-  onPlacementsUpdated(callback: PlacementsUpdatedCallback): () => void {
+  /** Called with the placements whose content changed. Returns a JoryioSubscription: `cancel()` it to stop (calling it is the same). */
+  onPlacementsUpdated(callback: PlacementsUpdatedCallback): JoryioSubscription {
     if (!this.isInitialized) {
       this.logger.error('SDK not initialized');
-      return () => undefined;
+      return joryioSubscription(() => undefined);
     }
     return this.placements.onPlacementsUpdated(callback);
   }
@@ -3542,11 +3543,15 @@ export class JoryioSDK {
     await this.cards.refreshCards();
   }
 
-  /** Called with the whole feed whenever it changes. Returns an unsubscribe function. */
-  onCardsUpdated(callback: CardsUpdatedCallback): () => void {
+  /**
+   * Called with the whole feed whenever it changes - the way to keep a feed UI
+   * of your own up to date. Returns a JoryioSubscription: `cancel()` it to stop
+   * (calling it, `sub()`, is the same).
+   */
+  onCardsUpdated(callback: CardsUpdatedCallback): JoryioSubscription {
     if (!this.isInitialized) {
       this.logger.error('SDK not initialized');
-      return () => undefined;
+      return joryioSubscription(() => undefined);
     }
     return this.cards.onCardsUpdated(callback);
   }
@@ -3611,11 +3616,11 @@ export class JoryioSDK {
     await this.flags.refreshFlags();
   }
 
-  /** Called with the keys whose value changed. Returns an unsubscribe function. */
-  onFlagsUpdated(callback: FlagsUpdatedCallback): () => void {
+  /** Called with the keys whose value changed. Returns a JoryioSubscription: `cancel()` it to stop (calling it is the same). */
+  onFlagsUpdated(callback: FlagsUpdatedCallback): JoryioSubscription {
     if (!this.isInitialized) {
       this.logger.error('SDK not initialized');
-      return () => undefined;
+      return joryioSubscription(() => undefined);
     }
     return this.flags.onFlagsUpdated(callback);
   }

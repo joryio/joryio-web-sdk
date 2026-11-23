@@ -100,6 +100,8 @@ export type {
   MountCardFeedOptions,
   CardsUpdatedCallback,
 } from './core/cards';
+// The one subscription every on...Updated listener returns (the same name on every Joryio SDK).
+export type { JoryioSubscription } from './core/subscription';
 // Feature flags + remote config (the same names and values on every Joryio SDK).
 export { FLAGS_MIN_REFRESH_SECONDS, FLAG_SYNC_PUSH_VALUE } from './core/flags';
 export type { FlagResult, FlagValueType, FlagReason, FlagsUpdatedCallback } from './core/flags';

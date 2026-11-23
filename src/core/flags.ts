@@ -23,6 +23,7 @@
  *
  * The same names and wire values on all five SDKs.
  */
+import { JoryioSubscription, joryioSubscription } from './subscription';
 import { Logger } from '../utils/logger';
 import { bucketHash } from '../utils/bucket-hash';
 import { sdkIdentityHeaders } from './config';
@@ -198,11 +199,16 @@ export class FlagsManager {
     await this.refresh(true);
   }
 
-  /** Called with the keys whose value changed. Returns an unsubscribe function. */
-  onFlagsUpdated(callback: FlagsUpdatedCallback): () => void {
-    this.listeners.add(callback);
+  /** Called with the keys whose value changed. Returns a JoryioSubscription. */
+  onFlagsUpdated(callback: FlagsUpdatedCallback): JoryioSubscription {
+    if (typeof callback !== 'function') return joryioSubscription(() => undefined);
+    // One entry per subscription, so the same function subscribed twice is two subscriptions.
+    const entry: FlagsUpdatedCallback = (keys) => callback(keys);
+    this.listeners.add(entry);
     this.use();
-    return () => this.listeners.delete(callback);
+    return joryioSubscription(() => {
+      this.listeners.delete(entry);
+    });
   }
 
   // ── internals ────────────────────────────────────────────────────────────

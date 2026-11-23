@@ -684,7 +684,9 @@ describe('placements: event triggers, listeners, session cache', () => {
     await flush();
     await p;
     expect(heard).toEqual([['home_hero']]);
-    off();
+    // A JoryioSubscription: cancel() stops it (calling it is the same); twice is harmless.
+    off.cancel();
+    off.cancel();
     m.invalidate();
     const q = m.getPlacements(['home_hero']);
     await flush();

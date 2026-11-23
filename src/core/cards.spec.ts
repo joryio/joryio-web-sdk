@@ -429,6 +429,29 @@ describe('cards: reporting', () => {
     expect(seen).toEqual([21, 10]);
   });
 
+  it('onCardsUpdated answers a JoryioSubscription: cancel() (or calling it) stops the updates, twice is harmless', async () => {
+    const m = make();
+    await m.getCards();
+    const seen: string[] = [];
+    const listener = () => seen.push('x');
+    const a = m.onCardsUpdated(listener);
+    const b = m.onCardsUpdated(listener); // the same function twice: two subscriptions
+    expect(typeof a.cancel).toBe('function');
+    m.markCardRead('a');
+    expect(seen).toEqual(['x', 'x']);
+    a.cancel();
+    a.cancel();
+    a();
+    m.markCardRead('b');
+    expect(seen).toEqual(['x', 'x', 'x']);
+    b();
+    m.dismissCard('a');
+    expect(seen).toEqual(['x', 'x', 'x']);
+    // Not a function: a no-op subscription.
+    const none = m.onCardsUpdated(undefined as any);
+    expect(() => none.cancel()).not.toThrow();
+  });
+
   it('an unknown card, or a card object from before a replacement, reports nothing', async () => {
     const m = make();
     const feed = await m.getCards();

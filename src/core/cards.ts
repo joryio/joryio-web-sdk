@@ -34,6 +34,7 @@
  *   identity and consent changes.
  */
 
+import { JoryioSubscription, joryioSubscription } from './subscription';
 import { Logger } from '../utils/logger';
 import { bucketHash } from '../utils/bucket-hash';
 import { sdkIdentityHeaders } from './config';
@@ -292,13 +293,15 @@ export class CardManager {
     await this.fetch(true);
   }
 
-  /** Called with the whole feed whenever it changes. Returns an unsubscribe. */
-  onCardsUpdated(callback: CardsUpdatedCallback): () => void {
-    if (typeof callback !== 'function') return () => undefined;
-    this.listeners.add(callback);
-    return () => {
-      this.listeners.delete(callback);
-    };
+  /** Called with the whole feed whenever it changes. Returns a JoryioSubscription. */
+  onCardsUpdated(callback: CardsUpdatedCallback): JoryioSubscription {
+    if (typeof callback !== 'function') return joryioSubscription(() => undefined);
+    // One entry per subscription, so the same function subscribed twice is two subscriptions.
+    const entry: CardsUpdatedCallback = (feed) => callback(feed);
+    this.listeners.add(entry);
+    return joryioSubscription(() => {
+      this.listeners.delete(entry);
+    });
   }
 
   markCardViewed(card: Card | string): void {

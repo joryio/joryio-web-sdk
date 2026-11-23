@@ -35,6 +35,8 @@ export interface LiquidField {
   insert(tag: string): void;
   /** Close a pill's fallback popover; true when one was open. */
   closePop(): boolean;
+  /** Open the fallback popover of the (first) pill of this variable path; false when there is none. */
+  openPill(path: string): boolean;
 }
 
 /** The words of a pill's fallback popover: `title` has `{name}`, the field's label. */
@@ -154,7 +156,7 @@ export function liquidField(opts: {
     const input = h('input', { dir: 'auto', 'data-j': 'fallback', 'aria-label': title, maxlength: '200' });
     input.value = varFallback(v.src) || '';
     const err = h('div', { class: 'err', 'data-j': 'fallback-error', role: 'alert' });
-    const done = h('button', { class: 'vc', type: 'button', 'data-j': 'fallback-done' }, words.done);
+    const done = h('button', { class: 'vc ui', type: 'button', 'data-j': 'fallback-done' }, words.done);
     const p = h('div', { class: 'pk fbp', role: 'dialog', 'aria-label': title, 'data-j': 'fallback-pop' }, h('label', { class: 'lbl' }, title), input, err, h('div', { class: 'help2' }, words.help), done);
     const finish = () => {
       closePop();
@@ -183,6 +185,11 @@ export function liquidField(opts: {
       }
     });
     done.addEventListener('click', finish);
+    // Focus leaving the popover (Tab away, a click elsewhere) closes it.
+    p.addEventListener('focusout', (e) => {
+      const to = e.relatedTarget as Node | null;
+      if (pop === p && (!to || !p.contains(to))) closePop();
+    });
     pop = p;
     el.appendChild(p);
     input.focus();
@@ -297,5 +304,13 @@ export function liquidField(opts: {
     emit();
   };
 
-  return { el, set, insert, closePop };
+  const openPill = (path: string): boolean => {
+    if (!box || box.tagName !== 'DIV') return false;
+    const target = Array.from(box.querySelectorAll(`[${PILL_ATTR}]`)).filter((n) => n.getAttribute('data-path') === path)[0] as HTMLElement | undefined;
+    if (!target) return false;
+    openPop(target);
+    return true;
+  };
+
+  return { el, set, insert, closePop, openPill };
 }

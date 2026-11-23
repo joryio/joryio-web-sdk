@@ -4,7 +4,7 @@
  */
 
 import { PageEditManager } from './page-edits';
-import { EditorGate, editorRequested } from './editor-gate';
+import { EditorGate, editorFrame, editorRequested } from './editor-gate';
 import { PageContextTracker } from './page-context';
 import { InitConfig, ResolvedConfig, resolveConfig, SDK_VERSION } from './config';
 import { StorageManager } from './storage';
@@ -348,6 +348,9 @@ export class JoryioSDK {
     if (keyProblem) {
       // eslint-disable-next-line no-console -- the logger is silent by default and this is the reason nothing works
       console.error(`[Joryio] SDK not started: ${keyProblem}. Calls on this instance are ignored.`);
+      this.disabled = true;
+    } else if (editorFrame()) {
+      // The page editor's Mobile view (a frame in the editor tab): a preview, not a visit - nothing is sent or applied.
       this.disabled = true;
     }
 

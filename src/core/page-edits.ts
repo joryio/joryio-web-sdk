@@ -24,6 +24,16 @@
  *   element appears (MutationObserver); personalized edits apply when the
  *   answer arrives and are never stored.
  * - A route change undoes this page's edits and applies the next page's.
+ * - Per device (1.4.0-beta.8): an edit may carry `device: 'mobile' | 'desktop'`
+ *   (absent or `all` = every device, as before). Mobile = a viewport narrower
+ *   than PAGE_EDIT_MOBILE_BREAKPOINT (768) CSS pixels, the one number the
+ *   backend, the dashboard and the editor use too. An edit for the other
+ *   device is not applied; when the viewport crosses the breakpoint (a
+ *   resize, a turned phone) every edit is undone and the ones for the new
+ *   width applied again, so a desktop and a mobile edit of one element never
+ *   fight. The SDK says it understands this with the capability
+ *   `page_edit_device`; the server sends an SDK without it no per-device
+ *   edit at all (an older build would apply both versions everywhere).
  * - Exposure: `in_app.displayed` once an edit of the experience landed on an
  *   element; a control visitor reports `in_app.control_viewed` once one of
  *   the control's selectors is on the page.
@@ -52,6 +62,26 @@ export const PAGE_EDIT_OPERATIONS = ['replace_text', 'replace_image', 'replace_l
 /** `replace` ("Instead of it"): the element is hidden and the spot takes its place, right after it. */
 export const PAGE_EDIT_POSITIONS = ['before', 'after', 'prepend', 'append', 'replace'] as const;
 export const PAGE_EDITS_CAPABILITY = 'page_edits';
+/** Which viewport an edit is for; absent = `all`. */
+export const PAGE_EDIT_DEVICES = ['all', 'mobile', 'desktop'] as const;
+/** Sent with `page_edits` by a build that applies an edit only on its device. */
+export const PAGE_EDIT_DEVICE_CAPABILITY = 'page_edit_device';
+/** Mobile = viewport width below this many CSS pixels (backend PAGE_EDIT_MOBILE_BREAKPOINT, the dashboard, the editor). */
+export const PAGE_EDIT_MOBILE_BREAKPOINT = 768;
+export const PAGE_EDIT_MOBILE_QUERY = '(max-width: 767.98px)';
+export type PageEditDevice = (typeof PAGE_EDIT_DEVICES)[number];
+
+/** True when this window is a mobile viewport (below the breakpoint). */
+export function isMobileViewport(win: Window = window): boolean {
+  try {
+    return typeof win.matchMedia === 'function' ? win.matchMedia(PAGE_EDIT_MOBILE_QUERY).matches : win.innerWidth < PAGE_EDIT_MOBILE_BREAKPOINT;
+  } catch {
+    return false;
+  }
+}
+
+/** An edit shows on this viewport: no device, `all`, or the viewport's own. */
+export const editShowsOn = (e: { device?: string }, mobile: boolean): boolean => !e.device || e.device === 'all' || (e.device === 'mobile') === mobile;
 /** The longest edited elements stay hidden while the SDK waits. Never the whole body. */
 export const PAGE_EDIT_ANTI_FLICKER_MS = 300;
 
@@ -114,6 +144,7 @@ const sameEdit = (a: PageEditWire, b: PageEditWire): boolean =>
   (a.value ?? null) === (b.value ?? null) &&
   (a.placementKey ?? null) === (b.placementKey ?? null) &&
   (a.position ?? null) === (b.position ?? null) &&
+  (a.device ?? null) === (b.device ?? null) &&
   !b.personalized;
 
 function serverMarkerElement(): HTMLScriptElement | null {
@@ -241,6 +272,8 @@ export interface PageEditWire {
   value?: string;
   placementKey?: string;
   position?: PageEditPosition;
+  /** Only this viewport (`mobile` / `desktop`); absent = every device. */
+  device?: 'mobile' | 'desktop';
   personalized?: true;
 }
 
@@ -296,7 +329,15 @@ export function isSafeEditUrl(url: unknown): url is string {
 /** The edit as this SDK will apply it, or null - an edit it does not trust is skipped whole. */
 export function trustedEdit(e: any): PageEditWire | null {
   if (!e || typeof e !== 'object' || typeof e.id !== 'string' || !isSafeSelector(e.selector)) return null;
-  const base = { id: e.id, selector: e.selector.trim(), ...(e.personalized === true ? { personalized: true as const } : {}) };
+  // A device this build does not know is skipped whole, never applied everywhere.
+  const device = e.device;
+  if (device != null && !(PAGE_EDIT_DEVICES as readonly unknown[]).includes(device)) return null;
+  const base = {
+    id: e.id,
+    selector: e.selector.trim(),
+    ...(device === 'mobile' || device === 'desktop' ? { device: device as 'mobile' | 'desktop' } : {}),
+    ...(e.personalized === true ? { personalized: true as const } : {}),
+  };
   switch (e.operation) {
     case 'hide':
       return { ...base, operation: 'hide' };
@@ -352,6 +393,9 @@ export class PageEditManager {
   /** The page those were written for: a route change elsewhere undoes them. */
   private serverUrl: string | null = null;
   private generation = 0;
+  /** The viewport the applied edits were chosen for (true = mobile). */
+  private mobile = false;
+  private offMedia: (() => void) | null = null;
   private started = false;
   private destroyed = false;
 
@@ -393,7 +437,25 @@ export class PageEditManager {
       this.observer = new MutationObserver(() => this.schedule());
       this.observer.observe(document.documentElement, { childList: true, subtree: true });
     }
+    this.mobile = isMobileViewport();
+    // The breakpoint crossed (resize, a turned phone): undo, and apply what fits the new width.
+    const mq = typeof window.matchMedia === 'function' ? window.matchMedia(PAGE_EDIT_MOBILE_QUERY) : null;
+    if (mq) {
+      const onChange = () => this.viewportChanged();
+      if (mq.addEventListener) mq.addEventListener('change', onChange);
+      else mq.addListener?.(onChange);
+      this.offMedia = () => (mq.removeEventListener ? mq.removeEventListener('change', onChange) : mq.removeListener?.(onChange));
+    }
     this.loadPage();
+  }
+
+  private viewportChanged(): void {
+    const mobile = isMobileViewport();
+    if (this.destroyed || mobile === this.mobile) return;
+    this.mobile = mobile;
+    if (!this.experiences.some((x) => x.edits.some((e) => e.device))) return;
+    this.revertAll();
+    this.applyAll();
   }
 
   /**
@@ -417,6 +479,8 @@ export class PageEditManager {
   destroy(): void {
     this.destroyed = true;
     this.pageUnsubscribe?.();
+    this.offMedia?.();
+    this.offMedia = null;
     this.observer?.disconnect();
     this.observer = null;
     this.revertAll();
@@ -609,7 +673,7 @@ export class PageEditManager {
       ...(personal ? { sessionId: this.session.getSessionId() } : {}),
       deviceType: 'web',
       locale: typeof navigator !== 'undefined' ? navigator.language : undefined,
-      capabilities: [PAGE_CONTEXT_CAPABILITY, PAGE_EDITS_CAPABILITY],
+      capabilities: [PAGE_CONTEXT_CAPABILITY, PAGE_EDITS_CAPABILITY, PAGE_EDIT_DEVICE_CAPABILITY],
       trackingConsent: consent,
       context: this.page ? this.page.current() : { url, pageVariables: {}, dataLayer: {} },
     };
@@ -678,6 +742,8 @@ export class PageEditManager {
         }
         let landed = false;
         for (const edit of x.edits) {
+          // Another device's edit: not on this viewport (applied when the width crosses the breakpoint).
+          if (!editShowsOn(edit, this.mobile)) continue;
           const token = `${x.wire.id}:${edit.id}`;
           const server = this.serverEdits().get(token);
           const byServer = !!server && server.variantId === (x.wire.variantId ?? null) && sameEdit(server.edit, edit);
@@ -825,7 +891,8 @@ export class PageEditManager {
   }
 
   private remember(url: string, experiences: Experience[], ttlSeconds?: number): void {
-    const selectors = [...new Set(experiences.flatMap((x) => (x.wire.isControl ? [] : x.edits.map((e) => e.selector))))];
+    // Held back next time: only what this viewport shows.
+    const selectors = [...new Set(experiences.flatMap((x) => (x.wire.isControl ? [] : x.edits.filter((e) => editShowsOn(e, this.mobile)).map((e) => e.selector))))];
     try {
       const all = JSON.parse(localStorage.getItem(this.stores.selectors) || '{}') || {};
       delete all[url];

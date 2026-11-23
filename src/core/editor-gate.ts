@@ -60,6 +60,27 @@ export function editorRequested(): boolean {
   }
 }
 
+/** The flag's value on the editor's own Mobile view (a frame of the page at phone width, 1.4.0-beta.8). */
+export const EDITOR_FRAME_FLAG = 'frame';
+
+/**
+ * True in the editor's Mobile view: a same-origin frame of the page, opened
+ * with `?joryio_editor=frame` by the editor running in its parent tab. The
+ * SDK there is inert (no page view, no in-app message, no page edit): the
+ * frame is a preview the editor draws on, not a visit. A frame on another
+ * origin, or one whose parent is not a running editor, is a normal page.
+ */
+export function editorFrame(): boolean {
+  try {
+    if (typeof window === 'undefined' || window.parent === window) return false;
+    if (new URLSearchParams(window.location.search).get(EDITOR_QUERY_FLAG) !== EDITOR_FRAME_FLAG) return false;
+    // Reading the parent's global throws across origins.
+    return !!(window.parent as any)[EDITOR_GLOBAL];
+  } catch {
+    return false;
+  }
+}
+
 function loadScript(src: string): Promise<void> {
   return loadSdkScript(src, 'data-joryio-editor');
 }

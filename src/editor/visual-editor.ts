@@ -32,15 +32,37 @@
  *   original nodes come back on undo - nothing is ever parsed as HTML.
  * - A dock: campaign · variant · page, the hint, "N edits" (a click jumps to
  *   that edit), Undo, "Save & return to Joryio".
+ * - Desktop / Mobile (1.4.0-beta.8): the dock's toggle shows the page at
+ *   phone width (MOBILE_FRAME_WIDTH, 390 px) - a same-origin frame of the
+ *   current URL with `?joryio_editor=frame` inside the editor's shadow root.
+ *   The SDK in that frame is inert (core editorFrame(): no page view, no
+ *   message, no live page edit); the editor works on the frame's document
+ *   (hover, selection, previews, selectors), its own UI stays in this tab.
+ *   The site's own scripts run in the frame, so its responsive layout, its
+ *   SPA routing and its lazy content are the real ones. Limits: a site that
+ *   forbids being framed (X-Frame-Options DENY, CSP frame-ancestors 'none')
+ *   shows a note instead - make the window narrower than 768 px; a page that
+ *   needs state of the tab (a cart, a form step reached by clicks) shows its
+ *   fresh load; the frame is a phone-width viewport, not a phone (no touch
+ *   events, the desktop browser's user agent).
+ * - Each edit applies to All devices (the default, as before), Mobile only
+ *   or Desktop only (the panel's "Applies to"); mobile = viewport below
+ *   PAGE_EDIT_MOBILE_BREAKPOINT (768 px), the SDK's rule. The live preview
+ *   shows only the edits of the current view, and the edit list marks the
+ *   per-device ones.
  *
  * Messages (constants: EDITOR_MESSAGES in the core, EDITOR_SESSION_MESSAGES
  * here; the dashboard's copy is packages/frontend/src/lib/web-experience.ts):
  *
  *   editor -> dashboard
  *     joryio:editor-active  { url }                       the editor is up
- *     joryio:editor-pick    { id, selector, operation, value?, placementKey?, position?, tag, text }
+ *     joryio:editor-pick    { id, selector, operation, value?, placementKey?, position?, device, tag, text }
  *                           a saved edit; `id` is the edit's id - an id the
- *                           dashboard already has REPLACES that edit
+ *                           dashboard already has REPLACES that edit.
+ *                           `device` (1.4.0-beta.8) is always sent: 'all' |
+ *                           'mobile' | 'desktop'. A pick WITHOUT it comes from
+ *                           an editor before beta.8, which drops the field:
+ *                           the dashboard keeps the stored device of that id
  *     joryio:editor-remove  { id }                        undo of a new edit
  *     joryio:editor-done    {}                            "Save & return to Joryio"
  *     joryio:editor-open-slot { placementKey, campaignId? }
@@ -52,7 +74,7 @@
  *     joryio:editor-closed  {}                            the editor stopped
  *
  *   dashboard -> editor
- *     joryio:editor-context { campaignName?, variantName?, edits?, focusId?,
+ *     joryio:editor-context { campaignName?, variantName?, edits? (each may carry device), focusId?,
  *                             attributes?: [{ key, label?, group? } | { name, custom? }],
  *                             placements?: [{ key, name?, campaigns?: [{ id, name, status, statusLabel? }] }],
  *                             openSlot?: true,
@@ -73,14 +95,14 @@
  * off (that dashboard would not hear a remove).
  */
 import type { Logger } from '../utils/logger';
-import { isSafeSelector, isSafeEditUrl, trustedEdit, type PageEditOperation, type PageEditPosition, type PageEditWire } from '../core/page-edits';
-import { EDITOR_MESSAGES } from '../core/editor-gate';
+import { editShowsOn, isMobileViewport, isSafeSelector, isSafeEditUrl, trustedEdit, type PageEditDevice, type PageEditOperation, type PageEditPosition, type PageEditWire } from '../core/page-edits';
+import { EDITOR_FRAME_FLAG, EDITOR_MESSAGES, EDITOR_QUERY_FLAG } from '../core/editor-gate';
 import { EDITOR_STRINGS, fill, mergeStrings, type EditorStringKey, type EditorStrings } from './editor-strings';
 import { VAR_PATH, kindKey, newEditId, pathTag, previewParts, slugify } from './editor-model';
-import { EDITOR_CSS, HOST_STYLE, PREVIEW_CSS, PREVIEW_HOST_STYLE, PREVIEW_VAR_HOST_STYLE, h, icon, type IconName } from './editor-ui';
-import { liquidField } from './liquid-field';
+import { EDITOR_CSS, HOST_STYLE, MOBILE_FRAME_WIDTH, PREVIEW_CSS, PREVIEW_HOST_STYLE, PREVIEW_VAR_HOST_STYLE, h, icon, type IconName } from './editor-ui';
+import { liquidField, type LiquidField } from './liquid-field';
 
-export { EDITOR_MESSAGES };
+export { EDITOR_MESSAGES, MOBILE_FRAME_WIDTH };
 
 export const EDITOR_SESSION_MESSAGES = {
   CONTEXT: 'joryio:editor-context',
@@ -97,8 +119,29 @@ const ATTRIBUTE_NAME = /^[A-Za-z_][A-Za-z0-9_]{0,63}$/;
 const MAX_TEXT = 2000;
 const MAX_EDITS = 100;
 const PREVIEW_TAG = 'joryio-editor-preview';
+/** The open overlays of the panel and what opens them: a press on anything else closes them. */
+const OVERLAY_PARTS = '[data-j="var-picker"],[data-j="more"],[data-j="fallback-pop"],[data-liquid]';
+
+/**
+ * Scroll the picker's list so the highlighted option shows whole - with its
+ * group heading when it is the group's first - inside the list only (never the
+ * panel or the page, as scrollIntoView would).
+ */
+export function revealOption(list: HTMLElement, o: HTMLElement | null): void {
+  if (!o) return;
+  const prev = o.previousElementSibling as HTMLElement | null;
+  const top = prev && prev.getAttribute('role') === 'presentation' ? prev : o;
+  if (top.offsetTop < list.scrollTop) list.scrollTop = top.offsetTop;
+  else if (o.offsetTop + o.offsetHeight > list.scrollTop + list.clientHeight) list.scrollTop = o.offsetTop + o.offsetHeight - list.clientHeight;
+}
 const OURS = '[data-joryio-editor]';
 const HELP_DISMISSED_KEY = 'jry_editor_help_dismissed';
+export type EditorView = 'desktop' | 'mobile';
+const DEVICES: Array<[PageEditDevice, EditorStringKey]> = [
+  ['all', 'devAll'],
+  ['mobile', 'devMobile'],
+  ['desktop', 'devDesktop'],
+];
 
 /** CSS.escape, for browsers (and test DOMs) without it. */
 export function cssEscape(value: string): string {
@@ -123,14 +166,14 @@ const VAR_PILL = 'var';
 function pageTarget(t: EventTarget | null): Element | null {
   let el = t instanceof Element ? t : null;
   if (el && el.getAttribute('data-joryio-editor') === VAR_PILL) el = el.parentElement;
-  return el && !isOurs(el) && el !== document.body && el !== document.documentElement ? el : null;
+  return el && !isOurs(el) && el !== el.ownerDocument.body && el !== el.ownerDocument.documentElement ? el : null;
 }
 
-/** The page's elements a selector finds - never the editor's own. */
-function pageMatches(selector: string): Element[] {
+/** The page's elements a selector finds - never the editor's own. `doc`: the tab's page, or the Mobile view's frame. */
+function pageMatches(selector: string, doc: Document): Element[] {
   if (!isSafeSelector(selector)) return [];
   try {
-    return Array.from(document.querySelectorAll(selector)).filter((e) => !isOurs(e));
+    return Array.from(doc.querySelectorAll(selector)).filter((e) => !isOurs(e));
   } catch {
     return [];
   }
@@ -209,6 +252,8 @@ export interface EditorPick {
   value?: string;
   placementKey?: string;
   position?: PageEditPosition;
+  /** Always sent by 1.4.0-beta.8 ('all' included), so the dashboard can tell it from an older editor's pick. */
+  device: PageEditDevice;
   tag: string;
   text: string;
 }
@@ -233,6 +278,7 @@ interface Draft {
   url: string;
   slotName: string;
   position: PageEditPosition;
+  device: PageEditDevice;
   selector: string;
   /** The edit being changed (opened from the list or the dashboard), null for a new one. */
   editingId: string | null;
@@ -272,7 +318,20 @@ interface SlotCampaign {
 const CAMPAIGN_ID = /^[A-Za-z0-9_-]{1,64}$/;
 
 const clip = (v: unknown, n: number): string => (typeof v === 'string' ? v.trim().slice(0, n) : '');
-const shortText = (el: Element | null): string => ((el && el.textContent) || '').replace(/\s+/g, ' ').trim();
+/**
+ * An element's own text, read from the page: never the editor's previews in it
+ * (a placeholder pill, a slot or "hidden" note) - a pill's text lives in its
+ * shadow root, so reading textContent over it would silently drop the variable.
+ */
+export const shortText = (el: Element | null): string => {
+  if (!el) return '';
+  let src: Element = el;
+  if (el.querySelector(OURS)) {
+    src = el.cloneNode(true) as Element;
+    for (const n of Array.from(src.querySelectorAll(OURS))) n.remove();
+  }
+  return (src.textContent || '').replace(/\s+/g, ' ').trim();
+};
 
 export class VisualEditor {
   private listeners: Array<() => void> = [];
@@ -293,6 +352,8 @@ export class VisualEditor {
   private showLiquid = false;
   /** Closes an open overlay of the panel (the variable picker) on Esc; true when it closed one. */
   private closeOverlay: (() => boolean) | null = null;
+  /** The New text field on screen (a page pill's click opens its fallback here). */
+  private field: LiquidField | null = null;
   private popOpen = false;
   private edits: PageEditWire[] = [];
   private history: Array<{ id: string; before: PageEditWire | null }> = [];
@@ -304,6 +365,15 @@ export class VisualEditor {
   private previewUndo: Array<() => void> = [];
   /** The page's own text / address of an element before any preview, for "Was:". */
   private originals = new WeakMap<Element, { text: string; href: string | null; src: string | null }>();
+  /** The page being edited: this tab's document, or the Mobile view's frame document. */
+  private doc: Document = document;
+  private view: EditorView = 'desktop';
+  private stage: HTMLElement | null = null;
+  private frame: HTMLIFrameElement | null = null;
+  /** Unbinds the listeners on the page being edited (this tab's, or the frame's). */
+  private offPage: (() => void) | null = null;
+  /** The viewport the preview was drawn for (a resize across 768 px redraws it). */
+  private mobileShown = false;
 
   constructor(
     private dashboardOrigin: string,
@@ -345,7 +415,9 @@ export class VisualEditor {
     for (const off of this.listeners.splice(0)) off();
     this.clearPreview();
     this.host?.remove();
-    this.host = this.root = this.wrap = this.hoverBox = this.selBox = this.dock = this.panel = this.help = null;
+    this.host = this.root = this.wrap = this.hoverBox = this.selBox = this.dock = this.panel = this.help = this.stage = this.frame = null;
+    this.doc = document;
+    this.view = 'desktop';
     this.selected = this.hovered = null;
     this.draft = null;
     try {
@@ -382,7 +454,61 @@ export class VisualEditor {
     this.host = host;
     this.root = root;
     this.wrap = wrap;
+    // A press anywhere in the editor's UI outside the open picker / fallback popover (and the
+    // button or pill that opens it) closes it.
+    const outside = (e: Event) => {
+      const path = typeof e.composedPath === 'function' ? e.composedPath() : [e.target];
+      if (path.some((n) => n instanceof Element && n.matches(OVERLAY_PARTS))) return;
+      this.closeOverlay?.();
+    };
+    wrap.addEventListener('pointerdown', outside);
+    wrap.addEventListener('mousedown', outside);
 
+    // Esc and the arrows also while the focus is in this tab (the panel, or the Mobile view's surroundings).
+    const onKey = (e: KeyboardEvent) => this.onKey(e);
+    doc.addEventListener('keydown', onKey, true);
+    const onResize = () => {
+      this.placeBoxes();
+      // The tab crossed the 768 px breakpoint: the preview shows the other device's edits.
+      if (this.view === 'desktop' && isMobileViewport(window) !== this.mobileShown) {
+        this.renderPreview();
+        if (this.draft) this.renderPanel();
+      }
+    };
+    window.addEventListener('resize', onResize);
+    this.listeners.push(
+      () => doc.removeEventListener('keydown', onKey, true),
+      () => window.removeEventListener('resize', onResize),
+      () => this.unbindPage(),
+    );
+    this.bindPage(doc, window);
+    this.renderDock();
+    this.renderHelp();
+    this.send({ type: EDITOR_MESSAGES.ACTIVE, url: `${location.origin}${location.pathname}` });
+  }
+
+  private onKey(e: KeyboardEvent): void {
+    if (e.key === 'Escape') {
+      if (this.closeOverlay && this.closeOverlay()) return;
+      if (this.popOpen) this.togglePop(false);
+      else if (this.panel) this.cancel();
+      else this.stop();
+      return;
+    }
+    if (isOurs(e.target instanceof Element ? e.target : null)) return; // typing in the panel
+    if (e.key === 'ArrowUp' || e.key === 'ArrowDown') {
+      const from = this.selected || this.hovered;
+      if (!from) return;
+      e.preventDefault();
+      e.stopPropagation();
+      this.move(e.key === 'ArrowUp' ? 'up' : 'down', from);
+    }
+  }
+
+  /** Hover, click (and keys, in a frame) on the page being edited; scroll moves the outlines. */
+  private bindPage(doc: Document, win: Window): void {
+    this.unbindPage();
+    this.doc = doc;
     const onMove = (e: MouseEvent) => {
       const t = e.target instanceof Element ? e.target : null;
       if (isOurs(t) && t!.getAttribute('data-joryio-editor') !== VAR_PILL) return;
@@ -394,45 +520,133 @@ export class VisualEditor {
       // A click on the page - a preview of ours included - never reaches the site.
       e.preventDefault();
       e.stopPropagation();
+      // An open picker or fallback popover: a click outside it only closes it, it selects nothing.
+      if (this.closeOverlay && this.closeOverlay()) return;
       const el = pageTarget(e.target);
-      if (el) this.select(el);
+      if (!el) return;
+      // A placeholder pill in the preview: its element's edit, and that variable's fallback - never a new draft.
+      const pill = e.target instanceof Element && e.target.getAttribute('data-joryio-editor') === VAR_PILL ? e.target.getAttribute('data-path') : null;
+      this.select(el);
+      if (pill) this.field?.openPill(pill);
     };
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
-        if (this.closeOverlay && this.closeOverlay()) return;
-        if (this.popOpen) this.togglePop(false);
-        else if (this.panel) this.cancel();
-        else this.stop();
-        return;
-      }
-      if (isOurs(e.target instanceof Element ? e.target : null)) return; // typing in the panel
-      if (e.key === 'ArrowUp' || e.key === 'ArrowDown') {
-        const from = this.selected || this.hovered;
-        if (!from) return;
-        e.preventDefault();
-        e.stopPropagation();
-        this.move(e.key === 'ArrowUp' ? 'up' : 'down', from);
-      }
-    };
-    const onScroll = () => {
-      this.place(this.hoverBox, this.hovered === this.selected ? null : this.hovered, true);
-      this.place(this.selBox, this.selected);
-    };
+    const onKey = (e: KeyboardEvent) => this.onKey(e);
+    const onScroll = () => this.placeBoxes();
+    const inFrame = doc !== document;
     doc.addEventListener('mousemove', onMove, true);
     doc.addEventListener('click', onClick, true);
-    doc.addEventListener('keydown', onKey, true);
-    window.addEventListener('scroll', onScroll, true);
-    window.addEventListener('resize', onScroll);
-    this.listeners.push(
-      () => doc.removeEventListener('mousemove', onMove, true),
-      () => doc.removeEventListener('click', onClick, true),
-      () => doc.removeEventListener('keydown', onKey, true),
-      () => window.removeEventListener('scroll', onScroll, true),
-      () => window.removeEventListener('resize', onScroll),
-    );
+    if (inFrame) doc.addEventListener('keydown', onKey, true);
+    win.addEventListener('scroll', onScroll, true);
+    if (inFrame) win.addEventListener('resize', onScroll);
+    this.offPage = () => {
+      doc.removeEventListener('mousemove', onMove, true);
+      doc.removeEventListener('click', onClick, true);
+      doc.removeEventListener('keydown', onKey, true);
+      win.removeEventListener('scroll', onScroll, true);
+      win.removeEventListener('resize', onScroll);
+    };
+  }
+
+  private unbindPage(): void {
+    const off = this.offPage;
+    this.offPage = null;
+    try {
+      off?.();
+    } catch {
+      /* the frame went away */
+    }
+  }
+
+  private placeBoxes(): void {
+    this.place(this.hoverBox, this.hovered === this.selected ? null : this.hovered, true);
+    this.place(this.selBox, this.selected);
+  }
+
+  /** The Desktop / Mobile view (the dock's toggle). */
+  currentView(): EditorView {
+    return this.view;
+  }
+
+  /** Switch the view. Mobile = the page at phone width, in a same-origin frame; `focusId` opens that edit there. */
+  setView(view: EditorView, focusId?: string): void {
+    if (!this.active || !this.wrap) return;
+    if (view === this.view) {
+      if (focusId) this.focusEdit(focusId);
+      return;
+    }
+    // Leave the page being edited as it was: no preview, no selection, no panel.
+    this.clearPreview();
+    this.unbindPage();
+    this.draft = null;
+    this.selected = this.hovered = null;
+    this.panel?.remove();
+    this.panel = null;
+    this.wrap.classList.remove('open');
+    this.popOpen = false;
+    this.stage?.remove();
+    this.stage = this.frame = null;
+    this.view = view;
+    // Until the frame has loaded, an empty page: nothing to match, nothing previewed in this tab.
+    this.doc = document.implementation.createHTMLDocument('');
+    if (view === 'desktop') {
+      this.bindPage(document, window);
+      this.renderAll();
+      if (focusId) this.focusEdit(focusId);
+      return;
+    }
+    const frame = h('iframe', { title: this.t.viewMobile, 'data-j': 'frame' }) as HTMLIFrameElement;
+    const url = new URL(location.href);
+    url.searchParams.set(EDITOR_QUERY_FLAG, EDITOR_FRAME_FLAG);
+    const stage = h('div', { class: 'stage', 'data-j': 'stage' }, frame);
+    frame.addEventListener('load', () => {
+      if (this.frame !== frame) return;
+      // Every load of the frame (its first, a redirect, a reload) is a new document to bind.
+      let doc: Document | null = null;
+      try {
+        doc = frame.contentDocument;
+        if (doc && (doc.URL === 'about:blank' || !doc.documentElement)) doc = null;
+      } catch {
+        doc = null; // another origin (a redirect), or the browser's own error page
+      }
+      if (!doc || !frame.contentWindow) {
+        // The site does not allow itself in a frame (X-Frame-Options, CSP frame-ancestors).
+        this.unbindPage();
+        this.doc = document.implementation.createHTMLDocument('');
+        frame.hidden = true;
+        stage.appendChild(h('div', { class: 'note fnote', role: 'status', 'data-j': 'frame-blocked' }, this.t.frameBlocked));
+        return;
+      }
+      this.clearPreview();
+      this.selected = this.hovered = null;
+      this.bindPage(doc, frame.contentWindow);
+      this.renderPreview();
+      this.placeBoxes();
+      if (focusId) {
+        this.focusEdit(focusId);
+        focusId = undefined;
+      }
+    });
+    frame.setAttribute('src', url.toString());
+    this.stage = stage;
+    this.frame = frame;
+    this.wrap.insertBefore(stage, this.wrap.firstChild);
+    this.renderAll();
+  }
+
+  private renderAll(): void {
+    this.renderPreview();
     this.renderDock();
     this.renderHelp();
-    this.send({ type: EDITOR_MESSAGES.ACTIVE, url: `${location.origin}${location.pathname}` });
+    this.placeBoxes();
+  }
+
+  /** True when the page being edited is a mobile viewport: the Mobile view, or a narrow tab. */
+  private mobileNow(): boolean {
+    return this.view === 'mobile' || isMobileViewport(window);
+  }
+
+  /** The edit shows in the current view (its device is All, or this view's). */
+  private inView(e: { device?: string }): boolean {
+    return editShowsOn(e, this.mobileNow());
   }
 
   /** The dashboard's context: words, campaign, the variant's edits (validated like the runtime does). */
@@ -458,7 +672,8 @@ export class VisualEditor {
             : typeof a.key === 'string' && VAR_PATH.test(a.key)
               ? { path: a.key, label: clip(a.label, 60) || a.key.split('.').pop()!, group: clip(a.group, 40) }
               : typeof a.name === 'string' && ATTRIBUTE_NAME.test(a.name)
-                ? { path: `user.${a.custom === true ? 'custom.' : ''}${a.name}`, label: a.name, group: '' }
+                ? // The older shape has no group: under "Profile" / "Custom fields", never after another group's heading.
+                  { path: `user.${a.custom === true ? 'custom.' : ''}${a.name}`, label: a.name, group: a.custom === true ? this.t.groupCustom : this.t.groupProfile }
                 : null,
         400,
       ),
@@ -511,7 +726,9 @@ export class VisualEditor {
       return;
     }
     const r = el.getBoundingClientRect();
-    Object.assign(box.style, { display: 'block', top: `${r.top - 2}px`, left: `${r.left - 2}px`, width: `${r.width + 4}px`, height: `${r.height + 4}px` });
+    // An element of the Mobile view's frame: its frame-viewport box, moved to where the frame sits in this tab.
+    const f = this.frame && el.ownerDocument !== document ? this.frame.getBoundingClientRect() : { top: 0, left: 0 };
+    Object.assign(box.style, { display: 'block', top: `${r.top + f.top - 2}px`, left: `${r.left + f.left - 2}px`, width: `${r.width + 4}px`, height: `${r.height + 4}px` });
     box.textContent = '';
     const label = `${this.t[kindKey(el.tagName)]} · ${el.tagName.toLowerCase()}`;
     box.appendChild(h('span', { class: 'chip', 'data-j': 'label' }, withLabel ? `${label} - ${this.t.clickToEdit}` : label));
@@ -519,15 +736,19 @@ export class VisualEditor {
 
   private move(dir: 'up' | 'down', from: Element): void {
     const next = dir === 'up' ? from.parentElement : Array.from(from.children).filter((c) => !isOurs(c))[0] || null;
-    if (!next || next === document.body || next === document.documentElement) return;
+    if (!next || next === from.ownerDocument.body || next === from.ownerDocument.documentElement) return;
     this.select(next);
   }
 
-  /** The edits on an element (its selector finds it, or is the selector the editor would make for it), oldest first. */
+  /**
+   * The edits on an element (its selector finds it, or is the selector the
+   * editor would make for it), oldest first - only those of the current view:
+   * in Mobile view a Desktop-only edit is not what the marketer is looking at.
+   */
   private editsOn(el: Element | null): PageEditWire[] {
     if (!el) return [];
     const own = robustSelector(el);
-    return this.edits.filter((e) => e.selector === own || pageMatches(e.selector).indexOf(el) >= 0);
+    return this.edits.filter((e) => this.inView(e) && (e.selector === own || pageMatches(e.selector, el.ownerDocument).indexOf(el) >= 0));
   }
 
   /**
@@ -538,6 +759,8 @@ export class VisualEditor {
    */
   select(el: Element, edit?: PageEditWire): void {
     if (!this.active) return;
+    // The element already open: keep the draft as typed (re-reading the page would lose it).
+    if (!edit && this.draft && el === this.selected) return;
     edit = edit || this.editsOn(el).pop();
     this.selected = el;
     this.hovered = null;
@@ -564,7 +787,7 @@ export class VisualEditor {
   private newDraft(el: Element, selector: string): Draft {
     const o = this.orig(el);
     const action: Action = el.tagName === 'IMG' ? 'image' : this.enabled('text', el) ? 'text' : el.tagName === 'A' ? 'link' : 'hide';
-    return { action, text: o.text.slice(0, MAX_TEXT), url: (action === 'image' ? o.src : o.href) || '', slotName: '', position: 'after', selector, editingId: null, touched: false };
+    return { action, text: o.text.slice(0, MAX_TEXT), url: (action === 'image' ? o.src : o.href) || '', slotName: '', position: 'after', device: 'all', selector, editingId: null, touched: false };
   }
 
   private draftOf(e: PageEditWire): Draft {
@@ -575,6 +798,7 @@ export class VisualEditor {
       url: action === 'link' || action === 'image' ? e.value || '' : '',
       slotName: e.placementKey || '',
       position: e.position || 'after',
+      device: e.device || 'all',
       selector: e.selector,
       editingId: e.id,
       touched: true,
@@ -590,7 +814,15 @@ export class VisualEditor {
   focusEdit(id: unknown): boolean {
     const edit = this.edits.filter((e) => e.id === id)[0];
     if (!edit || !this.active) return false;
-    const el = pageMatches(edit.selector)[0] || null;
+    // Another device's edit: switch to its view first (Mobile opens the frame and focuses it once loaded).
+    if (!this.inView(edit)) {
+      const want: EditorView = edit.device === 'mobile' ? 'mobile' : 'desktop';
+      if (want !== this.view) {
+        this.setView(want, edit.id);
+        if (want === 'mobile') return true;
+      }
+    }
+    const el = (this.inView(edit) && pageMatches(edit.selector, this.doc)[0]) || null;
     if (el) {
       try {
         el.scrollIntoView({ block: 'center' });
@@ -615,7 +847,7 @@ export class VisualEditor {
 
   /** The draft as an edit, or null while a field is not valid yet. */
   private draftEdit(d: Draft): PageEditWire | null {
-    const base = { id: d.editingId || '', selector: d.selector.trim() };
+    const base = { id: d.editingId || '', selector: d.selector.trim(), ...(d.device !== 'all' ? { device: d.device } : {}) };
     if (!isSafeSelector(base.selector)) return null;
     const operation = OPERATION_OF[d.action];
     if (d.action === 'hide') return { ...base, operation };
@@ -629,9 +861,9 @@ export class VisualEditor {
     const d = this.draft;
     const edit = d && this.draftEdit(d);
     if (!d || !edit) return;
-    const el = this.selected || pageMatches(edit.selector)[0] || null;
+    const el = this.selected || pageMatches(edit.selector, this.doc)[0] || null;
     const id = d.editingId || newEditId();
-    if (!this.pick(el, edit.selector, edit.operation, edit.value ?? edit.placementKey ?? '', { id, position: edit.position })) return;
+    if (!this.pick(el, edit.selector, edit.operation, edit.value ?? edit.placementKey ?? '', { id, position: edit.position, device: d.device })) return;
     // A saved slot stays open on its edit, with its campaigns or "Create content for this slot".
     if (edit.operation === 'insert_placement' && this.ctx.openSlot) this.focusEdit(id);
   }
@@ -653,7 +885,7 @@ export class VisualEditor {
    * in the list (and on the page). `value` is the text, the address or the
    * slot name (made a placement key).
    */
-  pick(el: Element | null, selector: string, operation: PageEditOperation, value: string, opts: { id?: string; position?: PageEditPosition } = {}): boolean {
+  pick(el: Element | null, selector: string, operation: PageEditOperation, value: string, opts: { id?: string; position?: PageEditPosition; device?: PageEditDevice } = {}): boolean {
     const id = opts.id || newEditId();
     const tag = el ? el.tagName.toLowerCase() : '';
     const text = el ? this.orig(el).text.slice(0, 200) : '';
@@ -669,7 +901,8 @@ export class VisualEditor {
       }
     }
     if (!edit) return false;
-    const msg: EditorPick = { type: EDITOR_MESSAGES.PICK, ...edit, tag, text } as EditorPick;
+    if (opts.device === 'mobile' || opts.device === 'desktop') edit.device = opts.device;
+    const msg: EditorPick = { type: EDITOR_MESSAGES.PICK, ...edit, device: edit.device || 'all', tag, text } as EditorPick;
     this.send(msg as unknown as Record<string, unknown>);
     const at = this.edits.map((e) => e.id).indexOf(id);
     this.history.push({ id, before: at >= 0 ? this.edits[at] : null });
@@ -704,7 +937,7 @@ export class VisualEditor {
     if (last.before) {
       if (at >= 0) this.edits[at] = last.before;
       const b = last.before;
-      this.send({ type: EDITOR_MESSAGES.PICK, ...b, tag: '', text: '' });
+      this.send({ type: EDITOR_MESSAGES.PICK, ...b, device: b.device || 'all', tag: '', text: '' });
     } else {
       if (at >= 0) this.edits.splice(at, 1);
       this.send({ type: EDITOR_SESSION_MESSAGES.REMOVE, id: last.id });
@@ -754,12 +987,14 @@ export class VisualEditor {
     const shown: PageEditWire[] = [];
     for (const e of this.edits) shown.push(d && d.editingId === e.id ? draft || e : e);
     if (d && !d.editingId && draft && d.touched) shown.push(draft);
-    for (const e of shown) for (const el of pageMatches(e.selector).slice(0, 50)) this.applyPreview(e, el);
+    // Only the current view's edits: a Mobile-only edit shows in Mobile view, not in Desktop.
+    this.mobileShown = this.mobileNow();
+    for (const e of shown) if (this.inView(e)) for (const el of pageMatches(e.selector, this.doc).slice(0, 50)) this.applyPreview(e, el);
     if (this.selected) this.place(this.selBox, this.selected);
   }
 
-  private previewNode(build: (root: ShadowRoot) => void, style = PREVIEW_HOST_STYLE, kind = 'preview'): HTMLElement {
-    const n = document.createElement(PREVIEW_TAG);
+  private previewNode(doc: Document, build: (root: ShadowRoot) => void, style = PREVIEW_HOST_STYLE, kind = 'preview'): HTMLElement {
+    const n = doc.createElement(PREVIEW_TAG);
     n.setAttribute('data-joryio-editor', kind);
     n.setAttribute('style', style);
     const root = n.attachShadow({ mode: 'open' });
@@ -768,7 +1003,15 @@ export class VisualEditor {
     return n;
   }
 
+  /** A variable's placeholder pill in the page preview; `data-path` names the variable (a click opens its fallback). */
+  private previewPill(doc: Document, path: string, label: string): HTMLElement {
+    const n = this.previewNode(doc, (r) => r.appendChild(h('span', { class: 'v', dir: 'auto' }, label)), PREVIEW_VAR_HOST_STYLE, VAR_PILL);
+    n.setAttribute('data-path', path);
+    return n;
+  }
+
   private applyPreview(e: PageEditWire, el: Element): void {
+    const doc = el.ownerDocument;
     if (!this.originals.has(el)) this.originals.set(el, { text: shortText(el), href: el.getAttribute('href'), src: el.getAttribute('src') });
     const undo = this.previewUndo;
     const attr = (name: string, value: string | null) => {
@@ -798,7 +1041,7 @@ export class VisualEditor {
         const kids = Array.from(el.childNodes);
         el.textContent = '';
         // A variable with neither a sample value nor a fallback is a pill, in its own shadow root.
-        for (const p of previewParts(e.value || '', this.ctx.sample)) el.appendChild(typeof p === 'string' ? document.createTextNode(p) : this.previewNode((r) => r.appendChild(h('span', { class: 'v', dir: 'auto' }, this.labelOf(p.path) || p.name)), PREVIEW_VAR_HOST_STYLE, VAR_PILL));
+        for (const p of previewParts(e.value || '', this.ctx.sample)) el.appendChild(typeof p === 'string' ? doc.createTextNode(p) : this.previewPill(doc, p.path, this.labelOf(p.path) || p.name));
         undo.push(() => {
           el.textContent = '';
           for (const k of kids) el.appendChild(k);
@@ -814,14 +1057,14 @@ export class VisualEditor {
         break;
       case 'hide': {
         const what = `${this.t[kindKey(el.tagName)]} "${this.orig(el).text.slice(0, 40)}"`;
-        insert(this.previewNode((r) => r.appendChild(h('div', { class: 'x' }, `${this.t.hiddenFor}: ${what}`))), 'after');
+        insert(this.previewNode(doc, (r) => r.appendChild(h('div', { class: 'x' }, `${this.t.hiddenFor}: ${what}`))), 'after');
         hide();
         break;
       }
       case 'insert_placement': {
         const where = e.position || 'after';
         insert(
-          this.previewNode((r) => r.appendChild(h('div', { class: 's' }, h('b', null, `${this.t.slotPreview} · `), h('code', null, e.placementKey || ''), h('div', null, this.t.slotHelp)))),
+          this.previewNode(doc, (r) => r.appendChild(h('div', { class: 's' }, h('b', null, `${this.t.slotPreview} · `), h('code', null, e.placementKey || ''), h('div', null, this.t.slotHelp)))),
           where,
         );
         if (where === 'replace') hide();
@@ -866,7 +1109,7 @@ export class VisualEditor {
   }
 
   private editTitle(e: PageEditWire): string {
-    const el = pageMatches(e.selector)[0];
+    const el = pageMatches(e.selector, this.doc)[0];
     const kind = this.t[el ? kindKey(el.tagName) : kindKey(e.selector, true)];
     return `${this.t[ACTION_LABEL[ACTION_OF[e.operation]]]} · ${kind}`;
   }
@@ -889,6 +1132,13 @@ export class VisualEditor {
     undoBtn.addEventListener('click', () => this.undo());
     const doneBtn = h('button', { class: 'go', type: 'button', 'data-j': 'done' }, t.saveReturn);
     doneBtn.addEventListener('click', () => this.done());
+    // Desktop / Mobile: the page as it is in this tab, or at phone width.
+    const views = h('span', { class: 'vw', role: 'radiogroup', 'aria-label': t.view, 'data-j': 'views' });
+    for (const [v, label] of [['desktop', t.viewDesktop], ['mobile', t.viewMobile]] as Array<[EditorView, string]>) {
+      const b = h('button', { type: 'button', role: 'radio', 'aria-checked': String(this.view === v), 'aria-label': label, title: label, 'data-j': `view-${v}` }, icon(v, 15));
+      b.addEventListener('click', () => this.setView(v));
+      views.appendChild(b);
+    }
     const dock = h(
       'div',
       { class: 'dock', 'data-j': 'dock', role: 'toolbar', 'aria-label': t.title },
@@ -898,6 +1148,7 @@ export class VisualEditor {
       h('span', { class: 'sep' }),
       h('span', { class: 'hint', 'data-j': 'hint' }, icon('cursor', 13), this.draft ? t.hintEditing : t.hintPoint),
       h('span', { class: 'sep' }),
+      views,
       countBtn,
       undoBtn,
       doneBtn,
@@ -906,7 +1157,8 @@ export class VisualEditor {
       const pop = h('div', { class: 'pop', 'data-j': 'edit-list', role: 'menu' });
       if (!n) pop.appendChild(h('div', { class: 'empty' }, t.noEdits));
       this.edits.forEach((e, i) => {
-        const b = h('button', { class: 'e', type: 'button', role: 'menuitem', 'data-j': 'edit-item', 'data-edit-id': e.id }, h('span', { class: 'num' }, String(i + 1)), this.editTitle(e));
+        const badge = e.device ? h('span', { class: 'bdg', 'data-j': 'device-badge' }, e.device === 'mobile' ? t.devMobile : t.devDesktop) : null;
+        const b = h('button', { class: 'e', type: 'button', role: 'menuitem', 'data-j': 'edit-item', 'data-edit-id': e.id }, h('span', { class: 'num' }, String(i + 1)), this.editTitle(e), badge);
         b.addEventListener('click', () => this.focusEdit(e.id));
         pop.appendChild(b);
       });
@@ -928,7 +1180,8 @@ export class VisualEditor {
     const crumbs = h('div', { class: 'crumbs', 'data-j': 'crumbs' });
     if (el) {
       const chain: Element[] = [];
-      for (let n: Element | null = el; n && n !== document.body && n !== document.documentElement; n = n.parentElement) chain.unshift(n);
+      const doc = el.ownerDocument;
+      for (let n: Element | null = el; n && n !== doc.body && n !== doc.documentElement; n = n.parentElement) chain.unshift(n);
       const shown = chain.slice(-3);
       const crumb = (label: string, target: Element | null, cur: boolean) => {
         const b = h('button', { class: cur ? 'crumb cur' : 'crumb', type: 'button', 'data-j': 'crumb', 'aria-current': cur ? 'true' : undefined, disabled: !target }, label);
@@ -937,7 +1190,7 @@ export class VisualEditor {
       };
       crumbs.appendChild(crumb(t.page, null, false));
       for (const n of shown) crumbs.append(icon('chevron', 9), crumb(t[kindKey(n.tagName)], n, n === el));
-      const up = h('button', { type: 'button', 'aria-label': t.up, title: t.up, 'data-j': 'up', disabled: !el.parentElement || el.parentElement === document.body }, icon('up', 12));
+      const up = h('button', { type: 'button', 'aria-label': t.up, title: t.up, 'data-j': 'up', disabled: !el.parentElement || el.parentElement === doc.body }, icon('up', 12));
       up.addEventListener('click', () => this.move('up', el));
       const down = h('button', { type: 'button', 'aria-label': t.down, title: t.down, 'data-j': 'down', disabled: !Array.from(el.children).some((c) => !isOurs(c)) }, icon('down', 12));
       down.addEventListener('click', () => this.move('down', el));
@@ -980,7 +1233,7 @@ export class VisualEditor {
       const valid = !!this.draftEdit(d);
       saveBtn.disabled = !valid;
       saveBtn.textContent = fill(t.save, { action: t[ACTION_LABEL[d.action]] });
-      const n = pageMatches(d.selector).length;
+      const n = pageMatches(d.selector, this.doc).length;
       pill.className = `pill ${n === 1 ? 'ok' : n > 1 ? 'many' : 'none'}`;
       pill.textContent = n === 1 ? t.matchOne : n > 1 ? fill(t.matchMany, { n }) : t.matchNone;
     };
@@ -996,7 +1249,21 @@ export class VisualEditor {
       this.showCss = !this.showCss;
       this.renderPanel();
     });
-    const body = h('div', { class: 'bd' }, h('span', { class: 'lbl' }, t.whatToDo), tiles, fields, cssToggle);
+    // "Applies to": All devices (default) / Mobile only / Desktop only - first in Mobile view, where it matters most.
+    const seg = h('div', { class: 'seg', role: 'radiogroup', 'aria-label': t.appliesTo, 'data-j': 'devices' });
+    for (const [dev, label] of DEVICES) {
+      const b = h('button', { type: 'button', role: 'radio', 'aria-checked': String(d.device === dev), 'data-j': `device-${dev}` }, t[label]);
+      b.addEventListener('click', () => {
+        if (d.device === dev) return;
+        d.device = dev;
+        d.touched = true;
+        this.renderPanel();
+        this.renderPreview();
+      });
+      seg.appendChild(b);
+    }
+    const devices = h('div', { class: this.view === 'mobile' ? 'dv top' : 'dv mt', 'data-j': 'applies-to' }, h('span', { class: 'lbl' }, t.appliesTo), seg, this.inView({ device: d.device }) ? null : h('div', { class: 'help2', 'data-j': 'device-hidden' }, t.deviceHidden));
+    const body = h('div', { class: 'bd' }, this.view === 'mobile' ? devices : null, h('span', { class: 'lbl' }, t.whatToDo), tiles, fields, this.view === 'mobile' ? null : devices, cssToggle);
     if (this.showCss) {
       const input = h('input', { class: 'mono', dir: 'ltr', 'aria-label': t.css, spellcheck: 'false', 'data-j': 'selector' });
       input.value = d.selector;
@@ -1004,7 +1271,7 @@ export class VisualEditor {
       const sync = () => {
         const ok = isSafeSelector(d.selector);
         note.className = ok ? 'help2' : 'err';
-        note.textContent = !d.selector.trim() ? t.noSelector : ok ? fill(t.cssHelp, { n: pageMatches(d.selector).length }) : t.cssBad;
+        note.textContent = !d.selector.trim() ? t.noSelector : ok ? fill(t.cssHelp, { n: pageMatches(d.selector, this.doc).length }) : t.cssBad;
       };
       input.addEventListener('input', () => {
         d.selector = input.value;
@@ -1029,6 +1296,7 @@ export class VisualEditor {
     const t = this.t;
     box.textContent = '';
     this.closeOverlay = null;
+    this.field = null;
     const was = (v: string | null) => (v ? h('span', { class: 'was', title: v }, fill(t.was, { value: v.slice(0, 60) })) : null);
     if (d.action === 'text') {
       let code: HTMLTextAreaElement | null = null;
@@ -1047,6 +1315,7 @@ export class VisualEditor {
         fallback: { title: t.fallbackFor, help: t.fallbackHelp, bad: t.fallbackBad, done: t.fallbackDone },
       });
       field.set(d.text);
+      this.field = field;
       const add = (v: Var) => field.insert(pathTag(v.path));
       const vars: Var[] = this.ctx.attributes.length ? this.ctx.attributes : ['firstName', 'lastName'].map((n) => ({ path: `user.${n}`, label: n, group: '' }));
       const common = COMMON_VARS.map((p) => vars.filter((v) => v.path === p)[0]).filter(Boolean);
@@ -1061,7 +1330,7 @@ export class VisualEditor {
       }
       if (vars.length > shown.length) {
         // "More…": the whole catalog, searchable, by group; ↑ ↓ Enter in the search box, Esc closes.
-        const more = h('button', { class: 'vc', type: 'button', 'aria-expanded': 'false', 'data-j': 'more' }, t.more);
+        const more = h('button', { class: 'vc ui', type: 'button', 'aria-expanded': 'false', 'data-j': 'more' }, t.more);
         const search = h('input', { dir: 'auto', 'aria-label': t.search, placeholder: t.search, 'data-j': 'var-search', role: 'combobox', 'aria-expanded': 'true' });
         const listEl = h('div', { role: 'listbox', 'aria-label': t.insert, 'data-j': 'var-list' });
         picker.append(search, listEl);
@@ -1096,6 +1365,8 @@ export class VisualEditor {
             listEl.appendChild(o);
           });
           search.setAttribute('aria-activedescendant', hits.length ? `jv${at}` : '');
+          const o = listEl.querySelector('[aria-selected="true"]') as HTMLElement | null;
+          revealOption(listEl, o);
         };
         search.addEventListener('input', () => {
           at = 0;
@@ -1106,20 +1377,24 @@ export class VisualEditor {
             e.preventDefault();
             at = (at + (e.key === 'ArrowDown' ? 1 : hits.length - 1)) % Math.max(hits.length, 1);
             draw();
-            const o = listEl.querySelector('[aria-selected="true"]') as HTMLElement | null;
-            if (o && o.scrollIntoView) o.scrollIntoView({ block: 'nearest' });
           } else if (e.key === 'Enter') {
             e.preventDefault();
             pick(hits[at]);
           }
         });
         more.addEventListener('mousedown', (e) => e.preventDefault());
+        // Focus leaving the picker (Tab, a click elsewhere) closes it; the More button toggles it itself.
+        picker.addEventListener('focusout', (e) => {
+          const to = e.relatedTarget as Node | null;
+          if (!to || (!picker.contains(to) && to !== more)) close();
+        });
         more.addEventListener('click', () => {
           if (close()) return;
           picker.hidden = false;
           more.setAttribute('aria-expanded', 'true');
           search.value = '';
           at = 0;
+          listEl.scrollTop = 0;
           draw();
           search.focus();
         });

@@ -2,7 +2,7 @@
  * @jest-environment jsdom
  * @jest-environment-options {"url": "https://shop.example/products/shoes?utm=x"}
  */
-import { PageEditManager, SERVER_PAGE_EDITS_MARKER_ID, SERVER_APPLIED_ATTR, SERVER_ORIG_ATTR, SERVER_SPOT_ATTR, PAGE_EDIT_ANTI_FLICKER_MS, PAGE_EDIT_OPERATIONS, PAGE_EDIT_POSITIONS, PAGE_EDITS_CAPABILITY, isSafeSelector, isSafeEditUrl, trustedEdit, pageEditsStorageKeys, SITE_SETTINGS_SESSION_REFRESH_SECONDS } from './page-edits';
+import { PageEditManager, SERVER_PAGE_EDITS_MARKER_ID, SERVER_APPLIED_ATTR, SERVER_ORIG_ATTR, SERVER_SPOT_ATTR, PAGE_EDIT_ANTI_FLICKER_MS, PAGE_EDIT_OPERATIONS, PAGE_EDIT_POSITIONS, PAGE_EDITS_CAPABILITY, PAGE_EDIT_DEVICES, PAGE_EDIT_DEVICE_CAPABILITY, PAGE_EDIT_MOBILE_BREAKPOINT, PAGE_EDIT_MOBILE_QUERY, editShowsOn, isSafeSelector, isSafeEditUrl, trustedEdit, pageEditsStorageKeys, SITE_SETTINGS_SESSION_REFRESH_SECONDS } from './page-edits';
 import { placementsStorageKey } from './placements';
 const KEYS = pageEditsStorageKeys('jry_sdk');
 
@@ -84,7 +84,7 @@ describe('page edits', () => {
     await flush();
     const req = calls.find((c) => c.path === '/api/v1/in-app/page-edits')!;
     expect(req.body.context.url).toBe('https://shop.example/products/shoes');
-    expect(req.body.capabilities).toEqual(['page_context', 'page_edits']);
+    expect(req.body.capabilities).toEqual(['page_context', 'page_edits', 'page_edit_device']);
     const h1 = document.querySelector('#hero h1')!;
     expect(h1.textContent).toBe('<b>Hi Ada</b>'); // text is text
     expect(h1.querySelector('b')).toBeNull();
@@ -823,3 +823,122 @@ describe('edits the server already applied (D450)', () => {
   });
 });
 
+
+describe('per-device edits (1.4.0-beta.8)', () => {
+  // A matchMedia whose answer the test moves across the breakpoint.
+  let mobileNow = false;
+  let listeners: Array<() => void> = [];
+  beforeEach(() => {
+    mobileNow = false;
+    listeners = [];
+    (window as any).matchMedia = jest.fn((q: string) => ({
+      get matches() {
+        return q === PAGE_EDIT_MOBILE_QUERY && mobileNow;
+      },
+      media: q,
+      addEventListener: (_t: string, f: () => void) => listeners.push(f),
+      removeEventListener: (_t: string, f: () => void) => (listeners = listeners.filter((x) => x !== f)),
+    }));
+  });
+  afterEach(() => {
+    delete (window as any).matchMedia;
+  });
+  const cross = (mobile: boolean) => {
+    mobileNow = mobile;
+    listeners.forEach((f) => f());
+  };
+  const both = () =>
+    experience([
+      { id: 'd1', selector: '#hero h1', operation: 'replace_text', value: 'Desktop hello', device: 'desktop' },
+      { id: 'm1', selector: '#hero h1', operation: 'replace_text', value: 'Mobile hi', device: 'mobile' },
+      { id: 'a1', selector: 'a.cta', operation: 'replace_link', value: 'https://shop.example/all' },
+      { id: 'm2', selector: '.promo', operation: 'hide', device: 'mobile' },
+    ]);
+
+  it('pins the device values, the breakpoint and the capability (the backend pins the same)', () => {
+    expect(PAGE_EDIT_DEVICES).toEqual(['all', 'mobile', 'desktop']);
+    expect(PAGE_EDIT_MOBILE_BREAKPOINT).toBe(768);
+    expect(PAGE_EDIT_MOBILE_QUERY).toBe('(max-width: 767.98px)');
+    expect(PAGE_EDIT_DEVICE_CAPABILITY).toBe('page_edit_device');
+  });
+
+  it('keeps a known device, drops `all`, and skips an edit for a device it does not know', () => {
+    expect(trustedEdit({ id: 'x', selector: 'h1', operation: 'hide', device: 'mobile' })).toEqual({ id: 'x', selector: 'h1', operation: 'hide', device: 'mobile' });
+    expect(trustedEdit({ id: 'x', selector: 'h1', operation: 'hide', device: 'all' })).toEqual({ id: 'x', selector: 'h1', operation: 'hide' });
+    expect(trustedEdit({ id: 'x', selector: 'h1', operation: 'hide', device: 'tablet' })).toBeNull();
+    expect(editShowsOn({}, true)).toBe(true);
+    expect(editShowsOn({ device: 'mobile' }, false)).toBe(false);
+    expect(editShowsOn({ device: 'desktop' }, false)).toBe(true);
+  });
+
+  it('applies only the edits of this viewport (desktop)', async () => {
+    answer = () => ({ body: { success: true, experiences: [both()] } });
+    const m = make();
+    m.start();
+    await flush();
+    await flush();
+    expect(document.querySelector('#hero h1')!.textContent).toBe('Desktop hello');
+    expect(document.querySelector('a.cta')!.getAttribute('href')).toBe('https://shop.example/all');
+    expect((document.querySelector('.promo') as HTMLElement).style.display).toBe('');
+    m.destroy();
+  });
+
+  it('applies only the edits of this viewport (mobile)', async () => {
+    mobileNow = true;
+    answer = () => ({ body: { success: true, experiences: [both()] } });
+    const m = make();
+    m.start();
+    await flush();
+    await flush();
+    expect(document.querySelector('#hero h1')!.textContent).toBe('Mobile hi');
+    expect((document.querySelector('.promo') as HTMLElement).style.display).toBe('none');
+    m.destroy();
+    expect(document.querySelector('#hero h1')!.textContent).toBe('Welcome');
+  });
+
+  it('crossing the breakpoint swaps the edits cleanly, both ways, and reports the exposure once', async () => {
+    answer = () => ({ body: { success: true, experiences: [both()] } });
+    const m = make();
+    m.start();
+    await flush();
+    await flush();
+    const h1 = document.querySelector('#hero h1')!;
+    expect(h1.textContent).toBe('Desktop hello');
+    cross(true);
+    expect(h1.textContent).toBe('Mobile hi');
+    expect((document.querySelector('.promo') as HTMLElement).style.display).toBe('none');
+    expect(document.querySelector('a.cta')!.getAttribute('href')).toBe('https://shop.example/all');
+    cross(false);
+    expect(h1.textContent).toBe('Desktop hello');
+    expect((document.querySelector('.promo') as HTMLElement).style.display).toBe('');
+    expect(tracks().filter((t) => t.action === 'displayed')).toHaveLength(1);
+    m.destroy();
+    expect(h1.textContent).toBe('Welcome');
+    expect(listeners).toHaveLength(0);
+  });
+
+  it('an experience whose only edits are for the other device lands nothing and reports nothing, until the width fits', async () => {
+    answer = () => ({ body: { success: true, experiences: [experience([{ id: 'm1', selector: '#hero h1', operation: 'replace_text', value: 'Mobile hi', device: 'mobile' }])] } });
+    const m = make();
+    m.start();
+    await flush();
+    await flush();
+    expect(m.appliedCount()).toBe(0);
+    expect(tracks()).toEqual([]);
+    cross(true);
+    expect(m.appliedCount()).toBe(1);
+    expect(tracks()).toEqual([expect.objectContaining({ action: 'displayed', campaignId: 'c1' })]);
+    m.destroy();
+  });
+
+  it('remembers for the anti-flicker only the selectors this viewport edits', async () => {
+    answer = () => ({ body: { success: true, experiences: [both()] } });
+    const m = make();
+    m.start();
+    await flush();
+    await flush();
+    const stored = JSON.parse(localStorage.getItem(KEYS.selectors) || '{}');
+    expect(Object.values(stored)[0]).toEqual(['#hero h1', 'a.cta']);
+    m.destroy();
+  });
+});

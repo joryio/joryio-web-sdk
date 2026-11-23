@@ -36,6 +36,8 @@ const ICONS = {
   chevron: ['m9 18 6-6-6-6'],
   check: ['M20 6 9 17l-5-5'],
   close: ['M18 6 6 18M6 6l12 12'],
+  desktop: ['M3 4h18v12H3z', 'M8 20h8M12 16v4'],
+  mobile: ['M7 2h10v20H7z', 'M11 18h2'],
 };
 export type IconName = keyof typeof ICONS;
 
@@ -56,6 +58,8 @@ export const HOST_STYLE = 'all:initial !important;position:fixed !important;top:
 /** A preview element the editor puts IN the page (a slot, a hidden-element note): its own shadow root too. */
 export const PREVIEW_HOST_STYLE = 'all:initial !important;display:block !important;margin:10px 0 !important';
 
+/** The editor's Mobile view width in CSS pixels (a common phone; below the 768 px breakpoint). */
+export const MOBILE_FRAME_WIDTH = 390;
 const FONT = 'Inter,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif';
 const MONO = 'ui-monospace,"SF Mono",Menlo,monospace';
 
@@ -148,9 +152,10 @@ input.slotin{border-color:#7A6CFF}
 .chips{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px;align-items:center}
 .chips span{font-size:11.5px;color:#6B7280;margin-inline-end:2px}
 .vc{font-family:${MONO};font-size:11.5px;padding:3px 8px;border-radius:6px;border:1px solid #E5EAF2;background:#F8FAFC;color:#3A4060}
+.vc.ui{font-family:${FONT};font-weight:600;letter-spacing:normal}
 .pk{margin-top:8px;border:1px solid #E5EAF2;border-radius:10px;padding:6px;background:#fff;box-shadow:0 8px 24px rgba(10,18,64,.1)}
 .pk input{height:34px}
-.pk [role=listbox]{max-height:220px;overflow:auto;margin-top:4px}
+.pk [role=listbox]{position:relative;max-height:220px;overflow:auto;overflow-anchor:none;margin-top:6px;padding-top:2px}
 .pk .g{font-size:10.5px;font-weight:700;color:#6B7280;text-transform:uppercase;letter-spacing:.4px;padding:8px 8px 3px}
 .pk .o{display:flex;justify-content:space-between;align-items:baseline;gap:8px;padding:6px 8px;border-radius:7px;font-size:12.5px;cursor:pointer}
 .pk .o[aria-selected=true],.pk .o:hover{background:#E5F9F6}
@@ -164,6 +169,15 @@ input.slotin{border-color:#7A6CFF}
 .seg{display:grid;grid-template-columns:1fr 1fr 1fr;gap:4px;background:#F3F5FA;border-radius:9px;padding:3px}
 .seg button{border:0;background:transparent;border-radius:7px;padding:6px 4px;font-size:12px;color:#3A4060}
 .seg button[aria-checked=true]{background:#fff;color:#0A1240;font-weight:600;box-shadow:0 1px 2px rgba(10,18,64,.08)}
+.vw{display:inline-flex;gap:2px;background:#1B245A;border-radius:8px;padding:2px}
+.vw button{height:28px;width:30px;border:0;border-radius:6px;background:transparent;color:#A8AEC1;display:grid;place-items:center}
+.vw button[aria-checked=true]{background:#31D6C8;color:#071342}
+.bdg{margin-inline-start:auto;font-size:10.5px;font-weight:600;padding:2px 7px;border-radius:999px;background:#F4F2FF;color:#4C3FD1;white-space:nowrap}
+.dv.top{margin-bottom:18px;padding:10px;border-radius:10px;background:#F4F2FF}
+.stage{position:fixed;inset:0;background:#E9ECF3;display:flex;justify-content:center;align-items:flex-start;padding:16px 16px 76px}
+.r.open .stage{inset-inline-end:380px}
+.stage iframe{width:${MOBILE_FRAME_WIDTH}px;max-width:100%;height:100%;border:0;border-radius:18px;background:#fff;box-shadow:0 12px 32px rgba(10,18,64,.18)}
+.fnote{max-width:360px;margin-top:40px}
 .css{margin-top:20px;display:inline-flex;align-items:center;gap:6px;border:0;background:transparent;padding:0;color:#6B7280;font-size:12px}
 .ft{padding:12px 18px;border-top:1px solid #E5EAF2;display:flex;gap:10px;background:#F8FAFC}
 .cancel{height:38px;padding:0 14px;border-radius:10px;border:1px solid #E5EAF2;background:#fff;color:#242B3A;font-size:13px;font-weight:600}

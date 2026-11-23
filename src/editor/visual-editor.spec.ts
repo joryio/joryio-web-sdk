@@ -2,7 +2,7 @@
  * @jest-environment jsdom
  * @jest-environment-options {"url": "https://shop.example/products/shoes?joryio_editor=1"}
  */
-import { VisualEditor, robustSelector, operationsFor, cssEscape, EDITOR_MESSAGES, EDITOR_SESSION_MESSAGES } from './visual-editor';
+import { VisualEditor, robustSelector, operationsFor, cssEscape, revealOption, shortText, EDITOR_MESSAGES, EDITOR_SESSION_MESSAGES } from './visual-editor';
 import { editorApi } from './index';
 import { EDITOR_GLOBAL, EDITOR_API_VERSION } from '../core/editor-gate';
 import { EDITOR_STRINGS } from './editor-strings';
@@ -227,6 +227,7 @@ describe('each action emits its operation', () => {
       selector: 'body > main > section:nth-of-type(1) > h2',
       operation: 'replace_text',
       value: 'Picked for you, {{ user.firstName | default: "friend" }}',
+      device: 'all',
       tag: 'h2',
       text: 'One',
     });
@@ -1084,5 +1085,302 @@ describe('a saved content slot: its campaigns, or "Create content for this slot"
     expect($('slot-content')).toBeNull();
     expect(ed.openSlot('home_hero')).toBe(false);
     expect(openSlots()).toEqual([]);
+  });
+});
+
+describe('Desktop / Mobile and per-device edits (1.4.0-beta.8)', () => {
+  const h2 = () => document.querySelector('main > section:nth-of-type(1) > h2')!;
+  /**
+   * The frame's page as loaded: a same-origin document. jsdom gives an iframe
+   * in a shadow root no browsing context (browsers do), so the test hands the
+   * frame its document and window, then fires its load.
+   */
+  const loadFrame = (frame: HTMLIFrameElement, html: string) => {
+    const doc = document.implementation.createHTMLDocument('');
+    doc.body.innerHTML = html;
+    Object.defineProperty(doc, 'URL', { configurable: true, value: 'https://shop.example/products/shoes?joryio_editor=frame' });
+    const win = { addEventListener: jest.fn(), removeEventListener: jest.fn() };
+    Object.defineProperty(frame, 'contentDocument', { configurable: true, get: () => doc });
+    Object.defineProperty(frame, 'contentWindow', { configurable: true, get: () => win });
+    frame.dispatchEvent(new Event('load'));
+    return doc;
+  };
+  const openMobile = (ed: VisualEditor, html = '<main><section><h2>Small one</h2></section><a href="/m">M</a></main>') => {
+    ed.setView('mobile');
+    const frame = $('frame') as HTMLIFrameElement;
+    return { frame, doc: loadFrame(frame, html) };
+  };
+
+  it('the dock has the Desktop / Mobile toggle, Desktop on', () => {
+    started();
+    expect($('view-desktop')!.getAttribute('aria-checked')).toBe('true');
+    expect($('view-mobile')!.getAttribute('aria-checked')).toBe('false');
+    expect($('view-mobile')!.getAttribute('aria-label')).toBe('Mobile');
+  });
+
+  it('"Applies to" defaults to All devices; Mobile only is sent as device, badged in the list, and not previewed in Desktop', async () => {
+    const ed = started();
+    await deliver({ type: EDITOR_SESSION_MESSAGES.CONTEXT });
+    ed.select(h2());
+    expect($('device-all')!.getAttribute('aria-checked')).toBe('true');
+    type($('text')!, 'Phones only');
+    expect(h2().textContent).toBe('Phones only');
+    click($('device-mobile')!);
+    expect($('device-mobile')!.getAttribute('aria-checked')).toBe('true');
+    expect(h2().textContent).toBe('One'); // a Mobile-only edit is not drawn in the Desktop view
+    expect($('device-hidden')!.textContent).toBe(EDITOR_STRINGS.deviceHidden);
+    click($('save')!);
+    expect(picks().at(-1)).toMatchObject({ operation: 'replace_text', value: 'Phones only', device: 'mobile' });
+    expect(ed.editList()[0]).toMatchObject({ device: 'mobile' });
+    click($('edits')!);
+    expect($$('device-badge').map((b) => b.textContent)).toEqual(['Mobile only']);
+  });
+
+  it('the context edits keep their device; the Desktop view previews All and Desktop-only, never Mobile-only', async () => {
+    const ed = started();
+    await deliver({
+      type: EDITOR_SESSION_MESSAGES.CONTEXT,
+      edits: [
+        { id: 'd1', selector: 'main > section:nth-of-type(1) > h2', operation: 'replace_text', value: 'Big screens', device: 'desktop' },
+        { id: 'm1', selector: 'main > section:nth-of-type(1) > h2', operation: 'replace_text', value: 'Small screens', device: 'mobile' },
+        { id: 'x1', selector: 'a', operation: 'hide', device: 'tablet' },
+      ],
+    });
+    expect(ed.editList().map((e) => [e.id, e.device])).toEqual([
+      ['d1', 'desktop'],
+      ['m1', 'mobile'],
+    ]);
+    expect(h2().textContent).toBe('Big screens');
+    // Selecting the element opens the edit of this view (the desktop one), not the latest overall.
+    ed.select(h2());
+    expect($('device-desktop')!.getAttribute('aria-checked')).toBe('true');
+    expect(textValue()).toBe('Big screens');
+  });
+
+  it('Undo of a device change sends the edit back with its old device, never without one', async () => {
+    const ed = started();
+    await deliver({ type: EDITOR_SESSION_MESSAGES.CONTEXT, edits: [{ id: 'e1', selector: 'main > section:nth-of-type(1) > h2', operation: 'replace_text', value: 'Hello' }] });
+    ed.select(h2());
+    click($('device-mobile')!);
+    click($('save')!);
+    expect(picks().at(-1)).toMatchObject({ id: 'e1', device: 'mobile' });
+    ed.undo();
+    expect(picks().at(-1)).toMatchObject({ id: 'e1', value: 'Hello', device: 'all' });
+  });
+
+  it('Mobile: the page at phone width in a same-origin frame flagged for the inert SDK; the editor edits the frame', async () => {
+    const ed = started();
+    await deliver({ type: EDITOR_SESSION_MESSAGES.CONTEXT, edits: [{ id: 'd1', selector: 'h2', operation: 'replace_text', value: 'Desktop words', device: 'desktop' }] });
+    expect(document.querySelector('main > section > h2')!.textContent).toBe('Desktop words');
+    const { frame, doc } = openMobile(ed);
+    expect(ed.currentView()).toBe('mobile');
+    expect($('view-mobile')!.getAttribute('aria-checked')).toBe('true');
+    expect(new URL(frame.getAttribute('src')!).searchParams.get('joryio_editor')).toBe('frame');
+    expect($('stage')).not.toBeNull();
+    // The tab's own page is left as the site drew it; the desktop-only edit is not in the frame.
+    expect(document.querySelector('main > section > h2')!.textContent).toBe('One');
+    expect(doc.querySelector('h2')!.textContent).toBe('Small one');
+    // A click in the frame selects there (and never reaches the site).
+    const heading = doc.querySelector('h2')!;
+    const ev = new MouseEvent('click', { bubbles: true, cancelable: true });
+    heading.dispatchEvent(ev);
+    expect(ev.defaultPrevented).toBe(true);
+    expect($('panel')).not.toBeNull();
+    // In Mobile view "Applies to" comes first.
+    expect($('fields')!.parentElement!.firstElementChild!.getAttribute('data-j')).toBe('applies-to');
+    type($('text')!, 'Tap here');
+    expect(heading.textContent).toBe('Tap here'); // the live preview is in the frame
+    click($('device-mobile')!);
+    click($('save')!);
+    expect(picks().at(-1)).toMatchObject({ selector: 'body > main > section > h2', value: 'Tap here', device: 'mobile' });
+    expect(heading.textContent).toBe('Tap here');
+    // Back to Desktop: the frame goes, the tab's page shows its desktop edit again, the mobile one does not.
+    click($('view-desktop')!);
+    expect($('frame')).toBeNull();
+    expect(document.querySelector('main > section > h2')!.textContent).toBe('Desktop words');
+  });
+
+  it('a jump to a Mobile-only edit from the Desktop list opens the Mobile view on it', async () => {
+    const ed = started();
+    await deliver({ type: EDITOR_SESSION_MESSAGES.CONTEXT, edits: [{ id: 'm1', selector: 'body > main > section > h2', operation: 'replace_text', value: 'Tiny', device: 'mobile' }] });
+    expect(ed.focusEdit('m1')).toBe(true);
+    expect(ed.currentView()).toBe('mobile');
+    const doc = loadFrame($('frame') as HTMLIFrameElement, '<main><section><h2>Small one</h2></section></main>');
+    expect(doc.querySelector('h2')!.textContent).toBe('Tiny');
+    expect($('panel')).not.toBeNull();
+    expect($('device-mobile')!.getAttribute('aria-checked')).toBe('true');
+  });
+
+  it('a site that refuses to be framed: a note in place of the frame, nothing edited in the tab', async () => {
+    const ed = started();
+    ed.setView('mobile');
+    const frame = $('frame') as HTMLIFrameElement;
+    // The browser's own error page (X-Frame-Options / frame-ancestors): no readable document.
+    Object.defineProperty(frame, 'contentDocument', { configurable: true, get: () => null });
+    frame.dispatchEvent(new Event('load'));
+    expect($('frame-blocked')!.textContent).toBe(EDITOR_STRINGS.frameBlocked);
+    click(document.querySelector('main > section > h2')!);
+    expect($('panel')).toBeNull();
+    click($('view-desktop')!);
+    expect($('frame-blocked')).toBeNull();
+  });
+
+  it('stop in Mobile view removes the frame with every other trace', () => {
+    const ed = started();
+    openMobile(ed);
+    ed.stop();
+    editor = null;
+    expect(document.querySelector('[data-joryio-editor]')).toBeNull();
+  });
+});
+
+describe('popovers close on an outside press; the list never hides its first row (beta.7 report)', () => {
+  const catalog = [
+    { key: 'user.firstName', label: 'First name', group: 'Profile' },
+    { key: 'user.lastName', label: 'Last name', group: 'Profile' },
+    { key: 'user.email', label: 'Email', group: 'Profile' },
+    { key: 'user.custom.city', label: 'City', group: 'Custom attributes' },
+    { key: 'user.custom.loyalty_tier', label: 'Loyalty tier', group: 'Custom attributes' },
+  ];
+  const h2 = () => document.querySelector('main > section:nth-of-type(1) > h2')!;
+  const press = (el: Element) => el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, composed: true }));
+  const open = async () => {
+    const ed = started();
+    await deliver({ type: EDITOR_SESSION_MESSAGES.CONTEXT, attributes: catalog });
+    ed.select(h2());
+    type($('text')!, 'Hi');
+    click($('more')!);
+    expect(($('var-picker') as HTMLElement).hidden).toBe(false);
+    return ed;
+  };
+
+  it('"More…" closes on a press elsewhere in the panel, and stays open for a press inside it', async () => {
+    await open();
+    press($('var-search')!);
+    expect(($('var-picker') as HTMLElement).hidden).toBe(false);
+    press($('title')!);
+    expect(($('var-picker') as HTMLElement).hidden).toBe(true);
+    expect($('more')!.getAttribute('aria-expanded')).toBe('false');
+    expect($('panel')).not.toBeNull();
+  });
+
+  it('a click on the page while it is open only closes it: nothing else is selected, the draft stays', async () => {
+    const ed = await open();
+    const other = document.querySelector('a')!;
+    const ev = new MouseEvent('click', { bubbles: true, cancelable: true });
+    other.dispatchEvent(ev);
+    expect(ev.defaultPrevented).toBe(true); // never reaches the site
+    expect(($('var-picker') as HTMLElement).hidden).toBe(true);
+    expect($('title')!.textContent).toContain('Heading');
+    expect(textValue()).toBe('Hi');
+    // The next click selects as usual.
+    click(other);
+    expect($('title')!.textContent).toContain('Link');
+    expect(ed.isActive()).toBe(true);
+  });
+
+  it('focus leaving the picker closes it', async () => {
+    await open();
+    $('var-picker')!.dispatchEvent(new FocusEvent('focusout', { bubbles: true, relatedTarget: $('text') }));
+    expect(($('var-picker') as HTMLElement).hidden).toBe(true);
+  });
+
+  it('a pill fallback popover closes on a press outside it too', async () => {
+    const ed = started();
+    await deliver({ type: EDITOR_SESSION_MESSAGES.CONTEXT, attributes: [{ name: 'firstName' }] });
+    ed.select(h2());
+    type($('text')!, 'Hi');
+    click($$('chip')[0]);
+    click(pills()[0]);
+    expect($('fallback-pop')).not.toBeNull();
+    press($('fallback')!);
+    expect($('fallback-pop')).not.toBeNull();
+    press($('title')!);
+    expect($('fallback-pop')).toBeNull();
+  });
+
+  it('the list opens at its top (the first group heading and row visible) and scrolls inside itself only', async () => {
+    await open();
+    const list = $('var-list')!;
+    expect(list.scrollTop).toBe(0);
+    expect(list.firstElementChild!.textContent).toBe('Profile');
+    // Geometry jsdom does not lay out: rows 30px, a heading 20px, a 100px list scrolled to 70.
+    const rows = Array.from(list.children) as HTMLElement[];
+    let y = 0;
+    for (const r of rows) {
+      const hgt = r.getAttribute('role') === 'presentation' ? 20 : 30;
+      Object.defineProperty(r, 'offsetTop', { configurable: true, value: y });
+      Object.defineProperty(r, 'offsetHeight', { configurable: true, value: hgt });
+      y += hgt;
+    }
+    Object.defineProperty(list, 'clientHeight', { configurable: true, value: 100 });
+    list.scrollTop = 70;
+    revealOption(list, rows[1]); // the first option: its heading comes back into view too
+    expect(list.scrollTop).toBe(0);
+    revealOption(list, rows[6]); // "Loyalty tier" (offset 160, 30 high): its bottom edge at the list's bottom
+    expect(list.scrollTop).toBe(90);
+  });
+});
+
+describe('a placeholder pill on the page (beta.7 report: a click on it removed the variable)', () => {
+  const h2 = () => document.querySelector('main > section:nth-of-type(1) > h2')!;
+  const pagePill = () => h2().querySelector('[data-joryio-editor="var"]') as HTMLElement;
+  const clickPage = (el: Element) => {
+    const ev = new MouseEvent('click', { bubbles: true, cancelable: true });
+    el.dispatchEvent(ev);
+    return ev;
+  };
+
+  it('while its edit is open: the text keeps its Liquid, and the pill fallback popover opens', async () => {
+    const ed = started();
+    await deliver({ type: EDITOR_SESSION_MESSAGES.CONTEXT, attributes: [{ name: 'firstName' }] });
+    ed.select(h2());
+    type($('text')!, 'היי');
+    click($$('chip')[0]);
+    expect(textValue()).toBe('היי {{ user.firstName }}');
+    expect(pagePill().getAttribute('data-path')).toBe('user.firstName');
+    expect(clickPage(pagePill()).defaultPrevented).toBe(true);
+    expect(textValue()).toBe('היי {{ user.firstName }}');
+    expect($('fallback-pop')).not.toBeNull();
+    expect($('fallback-pop')!.textContent).toContain('If firstName is missing');
+    expect(h2().querySelector('[data-joryio-editor="var"]')).not.toBeNull();
+  });
+
+  it('with the panel closed: it opens that element saved edit, unchanged, with the fallback popover', async () => {
+    const ed = started();
+    await deliver({ type: EDITOR_SESSION_MESSAGES.CONTEXT, edits: [{ id: 'e1', selector: 'main > section:nth-of-type(1) > h2', operation: 'replace_text', value: 'Hi {{ user.firstName }}' }] });
+    expect($('panel')).toBeNull();
+    clickPage(pagePill());
+    expect($('panel')).not.toBeNull();
+    expect(textValue()).toBe('Hi {{ user.firstName }}');
+    expect($('fallback-pop')).not.toBeNull();
+    expect(ed.editList()[0].value).toBe('Hi {{ user.firstName }}');
+    expect(picks()).toEqual([]);
+  });
+
+  it('a pill in the panel field opens its popover and never deletes it', async () => {
+    const ed = started();
+    await deliver({ type: EDITOR_SESSION_MESSAGES.CONTEXT, attributes: [{ name: 'firstName' }] });
+    ed.select(h2());
+    type($('text')!, 'Hi');
+    click($$('chip')[0]);
+    click(pills()[0]);
+    expect($('fallback-pop')).not.toBeNull();
+    expect(textValue()).toBe('Hi {{ user.firstName }}');
+  });
+
+  it('text read from the page never includes the editor previews in it', () => {
+    const el = document.createElement('h3');
+    el.appendChild(document.createTextNode('Hi '));
+    const pill = document.createElement('joryio-editor-preview');
+    pill.setAttribute('data-joryio-editor', 'var');
+    pill.textContent = 'firstName';
+    el.appendChild(pill);
+    const note = document.createElement('joryio-editor-preview');
+    note.setAttribute('data-joryio-editor', 'preview');
+    note.textContent = 'Content slot';
+    el.appendChild(note);
+    expect(shortText(el)).toBe('Hi');
+    expect(el.childNodes).toHaveLength(3); // the page itself is untouched
   });
 });

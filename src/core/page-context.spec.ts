@@ -14,6 +14,7 @@ import {
   PAGE_VARIABLE_SOURCES,
   PAGE_CONTEXT_CAPABILITY,
   PAGE_UTM_KEYS,
+  TOUCH_EXIT_INTENT,
 } from './page-context';
 
 /** Page context on web (D444 Phase 4, docs/PLACEMENTS_WEBSITE_LAYER.md 1), in a real DOM (jsdom). */
@@ -85,6 +86,152 @@ describe('page context', () => {
     history.pushState(null, '', '/next');
     leave(0);
     expect(seen.filter((t) => t === 'exit_intent')).toHaveLength(2);
+  });
+
+  describe('exit intent on a touch device: a fast scroll up after reading down', () => {
+    const C = TOUCH_EXIT_INTENT;
+    let now = 1_000_000;
+    let touch = true;
+    const queries: string[] = [];
+    beforeEach(() => {
+      now = 1_000_000;
+      touch = true;
+      queries.length = 0;
+      jest.spyOn(Date, 'now').mockImplementation(() => now);
+      (window as any).matchMedia = (q: string) => {
+        queries.push(q);
+        return {
+          media: q,
+          get matches() {
+            return touch;
+          },
+        };
+      };
+      Object.defineProperty(document.documentElement, 'scrollHeight', { configurable: true, value: 5000 });
+      Object.defineProperty(window, 'innerHeight', { configurable: true, value: 800 });
+      (window as any).scrollY = 0;
+    });
+    afterEach(() => {
+      jest.restoreAllMocks();
+      delete (window as any).matchMedia;
+      (window as any).scrollY = 0;
+    });
+    /** Scroll to y after `ms` milliseconds. */
+    const scrollTo = (y: number, ms = 100) => {
+      now += ms;
+      (window as any).scrollY = y;
+      window.dispatchEvent(new Event('scroll'));
+    };
+    const exits = (seen: string[]) => seen.filter((t) => t === 'exit_intent').length;
+    const started = () => {
+      tracker = new PageContextTracker();
+      tracker.start();
+      const seen: string[] = [];
+      tracker.onSignal((s) => seen.push(s.type));
+      return seen;
+    };
+
+    it('pins the thresholds', () => {
+      expect(C).toEqual({ armPercent: 25, armPx: 400, upPx: 120, windowMs: 300, minMs: 3000, sampleMs: 50 });
+    });
+
+    it('asks for a primary input without hover that is coarse', () => {
+      started();
+      expect(queries).toEqual(['(hover: none) and (pointer: coarse)']);
+    });
+
+    it('fires on a fast scroll up after scrolling down, once per page view', () => {
+      const seen = started();
+      now += 5000;
+      scrollTo(600);
+      scrollTo(1200);
+      scrollTo(1150, 100);
+      expect(exits(seen)).toBe(0); // 50 px up: still reading
+      scrollTo(1000, 100); // 200 px up within 200 ms
+      expect(exits(seen)).toBe(1);
+      expect(tracker.progress().exitIntent).toBe(true);
+      scrollTo(2000, 400);
+      scrollTo(1500, 100);
+      expect(exits(seen)).toBe(1);
+      // A route change is a new page view: armed again from scratch.
+      history.pushState(null, '', '/next');
+      expect(tracker.progress().exitIntent).toBe(false);
+      now += 5000;
+      scrollTo(1200);
+      scrollTo(900, 100);
+      expect(exits(seen)).toBe(2);
+    });
+
+    it('does not fire on a slow scroll up', () => {
+      const seen = started();
+      now += 5000;
+      scrollTo(1500);
+      for (let y = 1450; y >= 500; y -= 50) scrollTo(y, 200); // 50 px per 200 ms
+      expect(exits(seen)).toBe(0);
+    });
+
+    it('does not fire on a fast scroll up near the top of the page', () => {
+      const seen = started();
+      now += 5000;
+      scrollTo(350); // under 400 px and under 25% of the page
+      scrollTo(100, 100);
+      expect(exits(seen)).toBe(0);
+    });
+
+    it('arms at 25% of a short page even under 400 px', () => {
+      Object.defineProperty(document.documentElement, 'scrollHeight', { configurable: true, value: 1400 });
+      const seen = started();
+      now += 5000;
+      scrollTo(300); // 50% of 600 px scrollable
+      scrollTo(150, 100);
+      expect(exits(seen)).toBe(1);
+    });
+
+    it('does not fire in the first seconds after the page view starts', () => {
+      const seen = started();
+      scrollTo(1500, 500);
+      scrollTo(1000, 100); // 600 ms after start
+      expect(exits(seen)).toBe(0);
+      now += C.minMs;
+      scrollTo(1500, 100);
+      scrollTo(1000, 100);
+      expect(exits(seen)).toBe(1);
+    });
+
+    it('desktop (a fine pointer with hover): a fast scroll up is not exit intent, the pointer rule is unchanged', () => {
+      touch = false;
+      const seen = started();
+      now += 5000;
+      scrollTo(1500);
+      scrollTo(1000, 100);
+      expect(exits(seen)).toBe(0);
+      document.dispatchEvent(new MouseEvent('mouseout', { clientY: -1, relatedTarget: null }));
+      expect(exits(seen)).toBe(1);
+    });
+
+    it('a browser without matchMedia keeps the desktop rule only', () => {
+      delete (window as any).matchMedia;
+      const seen = started();
+      now += 5000;
+      scrollTo(1500);
+      scrollTo(1000, 100);
+      expect(exits(seen)).toBe(0);
+    });
+
+    it('destroy removes the scroll listener', () => {
+      const add = jest.spyOn(window, 'addEventListener');
+      const remove = jest.spyOn(window, 'removeEventListener');
+      const seen = started();
+      const scrollFns = add.mock.calls.filter((c) => c[0] === 'scroll').map((c) => c[1]);
+      expect(scrollFns).toHaveLength(1);
+      expect(add.mock.calls.find((c) => c[0] === 'scroll')?.[2]).toEqual({ passive: true });
+      tracker.destroy();
+      expect(remove.mock.calls.some((c) => c[0] === 'scroll' && c[1] === scrollFns[0])).toBe(true);
+      now += 5000;
+      scrollTo(1500);
+      scrollTo(1000, 100);
+      expect(exits(seen)).toBe(0);
+    });
   });
 
   it('scroll depth is the maximum percent reached, reset by a route change', () => {

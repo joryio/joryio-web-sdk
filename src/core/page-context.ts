@@ -212,6 +212,39 @@ export interface PageContextOptions {
   dataLayerName?: string;
 }
 
+/**
+ * Exit intent on a touch device. There is no pointer to leave through the top
+ * of the window, so the signal is a fast scroll UP after reading down the page:
+ * the visitor heading back for the address bar or the tab switcher (mobile
+ * browsers reveal their toolbar on exactly that gesture).
+ *
+ * - a touch device: the PRIMARY input has no hover and is coarse,
+ *   `(hover: none) and (pointer: coarse)`. A laptop with a touch screen, or a
+ *   tablet with a mouse or trackpad attached, reports its primary input as fine
+ *   with hover and keeps the desktop rule - a scroll wheel moving up fast there
+ *   is reading, not leaving. Read live (a MediaQueryList), never cached.
+ * - armed only once the visitor has scrolled down at least `armPercent` of the
+ *   page or `armPx` CSS pixels (whichever comes first) in this page view;
+ * - fires on a scroll up of at least `upPx` within `windowMs`;
+ * - never in the first `minMs` after the page view started (load or route
+ *   change), so a page restoring its scroll position or a jump to an anchor
+ *   is not an exit;
+ * - scroll positions are sampled at most every `sampleMs` (passive listener).
+ *
+ * Once per page view, like the desktop rule: the same `exitFired` flag, reset
+ * by a route change.
+ */
+export const TOUCH_EXIT_INTENT = {
+  armPercent: 25,
+  armPx: 400,
+  upPx: 120,
+  windowMs: 300,
+  minMs: 3000,
+  sampleMs: 50,
+} as const;
+
+const TOUCH_PRIMARY_QUERY = '(hover: none) and (pointer: coarse)';
+
 export type PageSignal = { type: 'page_change'; url: string | null } | { type: 'exit_intent' } | { type: 'scroll_depth'; percent: number } | { type: 'time_on_page'; seconds: number };
 
 /**
@@ -228,6 +261,11 @@ export class PageContextTracker {
   private visibleMs = 0;
   private visibleSince: number | null = null;
   private exitFired = false;
+  /** Touch exit intent: when this page view started, the deepest scrollY, and the recent samples. */
+  private pageStartedAt = Date.now();
+  private maxScrollY = 0;
+  private scrollSamples: Array<{ y: number; t: number }> = [];
+  private touchQuery: MediaQueryList | null = null;
   private timer: ReturnType<typeof setInterval> | null = null;
   private undo: Array<() => void> = [];
   private started = false;
@@ -341,7 +379,21 @@ export class PageContextTracker {
       this.undo.push(() => target.removeEventListener(ev, fn, opts));
     };
     on(window, 'popstate', () => this.checkRoute());
-    on(window, 'scroll', () => this.measureScroll(), { passive: true });
+    this.pageStartedAt = Date.now();
+    try {
+      this.touchQuery = typeof window.matchMedia === 'function' ? window.matchMedia(TOUCH_PRIMARY_QUERY) : null;
+    } catch {
+      this.touchQuery = null;
+    }
+    on(
+      window,
+      'scroll',
+      () => {
+        this.measureScroll();
+        this.touchExitIntent();
+      },
+      { passive: true },
+    );
     on(document, 'mouseout', (e: MouseEvent) => {
       // Leaving through the top of the window, toward the tabs and the address bar.
       if (this.exitFired || e.relatedTarget || (e as any).toElement) return;
@@ -370,6 +422,8 @@ export class PageContextTracker {
       }
     }
     this.listeners.clear();
+    this.scrollSamples = [];
+    this.touchQuery = null;
     this.started = false;
   }
 
@@ -382,6 +436,9 @@ export class PageContextTracker {
     this.visibleMs = 0;
     this.visibleSince = typeof document !== 'undefined' && document.visibilityState === 'hidden' ? null : Date.now();
     this.exitFired = false;
+    this.pageStartedAt = Date.now();
+    this.maxScrollY = 0;
+    this.scrollSamples = [];
     this.emit({ type: 'page_change', url });
   }
 
@@ -416,6 +473,32 @@ export class PageContextTracker {
       if (percent > this.maxScrollPercent) {
         this.maxScrollPercent = percent;
         this.emit({ type: 'scroll_depth', percent });
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+
+  /** Exit intent on a touch device: a fast scroll up once the page was read down (TOUCH_EXIT_INTENT). */
+  private touchExitIntent(): void {
+    if (this.exitFired || !this.touchQuery?.matches) return;
+    try {
+      const c = TOUCH_EXIT_INTENT;
+      const now = Date.now();
+      const last = this.scrollSamples[this.scrollSamples.length - 1];
+      if (last && now - last.t < c.sampleMs) return;
+      const y = Math.max(0, window.scrollY || document.documentElement.scrollTop || 0);
+      if (y > this.maxScrollY) this.maxScrollY = y;
+      this.scrollSamples = this.scrollSamples.filter((s) => now - s.t <= c.windowMs);
+      this.scrollSamples.push({ y, t: now });
+      if (now - this.pageStartedAt < c.minMs) return;
+      if (this.maxScrollY < c.armPx && this.maxScrollPercent < c.armPercent) return;
+      let peak = y;
+      for (const s of this.scrollSamples) if (s.y > peak) peak = s.y;
+      if (peak - y >= c.upPx) {
+        this.exitFired = true;
+        this.scrollSamples = [];
+        this.emit({ type: 'exit_intent' });
       }
     } catch {
       /* ignore */

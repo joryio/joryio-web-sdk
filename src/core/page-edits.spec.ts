@@ -2,7 +2,7 @@
  * @jest-environment jsdom
  * @jest-environment-options {"url": "https://shop.example/products/shoes?utm=x"}
  */
-import { PageEditManager, SERVER_PAGE_EDITS_MARKER_ID, SERVER_APPLIED_ATTR, SERVER_ORIG_ATTR, SERVER_SPOT_ATTR, PAGE_EDIT_ANTI_FLICKER_MS, PAGE_EDIT_OPERATIONS, PAGE_EDIT_POSITIONS, PAGE_EDITS_CAPABILITY, PAGE_EDIT_DEVICES, PAGE_EDIT_DEVICE_CAPABILITY, PAGE_EDIT_MOBILE_BREAKPOINT, PAGE_EDIT_MOBILE_QUERY, editShowsOn, isSafeSelector, isSafeEditUrl, trustedEdit, pageEditsStorageKeys, SITE_SETTINGS_SESSION_REFRESH_SECONDS } from './page-edits';
+import { PageEditManager, SERVER_PAGE_EDITS_MARKER_ID, SERVER_APPLIED_ATTR, SERVER_ORIG_ATTR, SERVER_SPOT_ATTR, PAGE_EDIT_ANTI_FLICKER_MS, PAGE_EDIT_OPERATIONS, PAGE_EDIT_POSITIONS, PAGE_EDITS_CAPABILITY, PAGE_EDIT_DEVICES, PAGE_EDIT_MOBILE_BREAKPOINT, PAGE_EDIT_MOBILE_QUERY, editShowsOn, isSafeSelector, isSafeEditUrl, trustedEdit, pageEditsStorageKeys, SITE_SETTINGS_SESSION_REFRESH_SECONDS } from './page-edits';
 import { placementsStorageKey } from './placements';
 const KEYS = pageEditsStorageKeys('jry_sdk');
 
@@ -84,7 +84,7 @@ describe('page edits', () => {
     await flush();
     const req = calls.find((c) => c.path === '/api/v1/in-app/page-edits')!;
     expect(req.body.context.url).toBe('https://shop.example/products/shoes');
-    expect(req.body.capabilities).toEqual(['page_context', 'page_edits', 'page_edit_device']);
+    expect(req.body.capabilities).toEqual(['page_context', 'page_edits']);
     const h1 = document.querySelector('#hero h1')!;
     expect(h1.textContent).toBe('<b>Hi Ada</b>'); // text is text
     expect(h1.querySelector('b')).toBeNull();
@@ -855,11 +855,11 @@ describe('per-device edits (1.4.0-beta.8)', () => {
       { id: 'm2', selector: '.promo', operation: 'hide', device: 'mobile' },
     ]);
 
-  it('pins the device values, the breakpoint and the capability (the backend pins the same)', () => {
+  it('pins the device values and the breakpoint (the backend pins the same); no device capability since beta.9', () => {
     expect(PAGE_EDIT_DEVICES).toEqual(['all', 'mobile', 'desktop']);
     expect(PAGE_EDIT_MOBILE_BREAKPOINT).toBe(768);
     expect(PAGE_EDIT_MOBILE_QUERY).toBe('(max-width: 767.98px)');
-    expect(PAGE_EDIT_DEVICE_CAPABILITY).toBe('page_edit_device');
+    expect(PAGE_EDITS_CAPABILITY).toBe('page_edits');
   });
 
   it('keeps a known device, drops `all`, and skips an edit for a device it does not know', () => {

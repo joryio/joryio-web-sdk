@@ -86,6 +86,10 @@ export type {
   PlacementsUpdatedCallback,
 } from './core/placements';
 
+// Show when: the moment a placement item or page edit is revealed (the same names and values on every Joryio SDK).
+export { SHOW_WHEN_KINDS } from './core/show-when';
+export type { ShowWhen, ShowWhenKind } from './core/show-when';
+
 // Links: the site-wide link handler (the same names and source values on every Joryio SDK).
 export type { JoryioLink, JoryioLinkSource, JoryioLinkHandler } from './core/links';
 

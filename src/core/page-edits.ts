@@ -31,9 +31,9 @@
  *   device is not applied; when the viewport crosses the breakpoint (a
  *   resize, a turned phone) every edit is undone and the ones for the new
  *   width applied again, so a desktop and a mobile edit of one element never
- *   fight. The SDK says it understands this with the capability
- *   `page_edit_device`; the server sends an SDK without it no per-device
- *   edit at all (an older build would apply both versions everywhere).
+ *   fight. The server sends per-device edits to every build (1.4.0-beta.9
+ *   dropped the `page_edit_device` capability); a build before beta.8
+ *   applies them on every device.
  * - Exposure: `in_app.displayed` once an edit of the experience landed on an
  *   element; a control visitor reports `in_app.control_viewed` once one of
  *   the control's selectors is on the page.
@@ -48,6 +48,15 @@
  *   when the definitive answer for this visitor no longer carries it -
  *   paused, edited, the visitor suppressed or in a control, page edits
  *   switched off - or on a route change to another page.
+ * - Show when (D465, show-when.ts): an experience with a `showWhen` other
+ *   than load is held - not applied, kept out of the anti-flicker rule and
+ *   out of the selectors remembered for it - and applied at its moment in
+ *   this page view; `in_app.displayed` once an edit lands after it. A
+ *   control's `control_viewed` waits for its moment too. A route change asks
+ *   for the new page and the moments start again. An event in the answer's
+ *   `recheckOn` (or one an experience waits on) asks again for this page at
+ *   once, once per page view. A server-applied edit of an experience that
+ *   now waits for a moment is undone and re-applied by the SDK at the moment.
  */
 import { bucketHash } from '../utils/bucket-hash';
 import type { IdentityManager } from './identity';
@@ -57,6 +66,7 @@ import type { InAppAuthProvider } from './inapp';
 import type { PlacementConsent } from './placements';
 import { sdkIdentityHeaders } from './config';
 import { currentPageUrl, PAGE_CONTEXT_CAPABILITY, type PageContextTracker } from './page-context';
+import { eventNames, isDeferred, parseShowWhen, type RecheckEvent, type ShowWhenMoments } from './show-when';
 
 export const PAGE_EDIT_OPERATIONS = ['replace_text', 'replace_image', 'replace_link', 'hide', 'insert_placement'] as const;
 /** `replace` ("Instead of it"): the element is hidden and the spot takes its place, right after it. */
@@ -64,8 +74,6 @@ export const PAGE_EDIT_POSITIONS = ['before', 'after', 'prepend', 'append', 'rep
 export const PAGE_EDITS_CAPABILITY = 'page_edits';
 /** Which viewport an edit is for; absent = `all`. */
 export const PAGE_EDIT_DEVICES = ['all', 'mobile', 'desktop'] as const;
-/** Sent with `page_edits` by a build that applies an edit only on its device. */
-export const PAGE_EDIT_DEVICE_CAPABILITY = 'page_edit_device';
 /** Mobile = viewport width below this many CSS pixels (backend PAGE_EDIT_MOBILE_BREAKPOINT, the dashboard, the editor). */
 export const PAGE_EDIT_MOBILE_BREAKPOINT = 768;
 export const PAGE_EDIT_MOBILE_QUERY = '(max-width: 767.98px)';
@@ -147,7 +155,8 @@ const sameEdit = (a: PageEditWire, b: PageEditWire): boolean =>
   (a.device ?? null) === (b.device ?? null) &&
   !b.personalized;
 
-function serverMarkerElement(): HTMLScriptElement | null {
+/** The plugin's marker block: a JSON `<script>` that is a direct child of `<head>`, or null (also read by placements.ts). */
+export function serverMarkerElement(): HTMLScriptElement | null {
   const head = document.head;
   if (!head) return null;
   for (const c of Array.from(head.children)) {
@@ -286,12 +295,16 @@ export interface PageEditExperienceWire {
   controlToken: string | null;
   selectors: string[];
   edits: PageEditWire[];
+  /** Show when (D465): the moment its edits are applied (control: the moment it counts as viewed); absent = on load. */
+  showWhen?: unknown;
 }
 
 export interface PageEditsResponse {
   success?: boolean;
   ttlSeconds?: number;
   experiences?: PageEditExperienceWire[];
+  /** Show when: event names that make the SDK ask again for this page at once. */
+  recheckOn?: string[];
 }
 
 export interface PageEditRuntime {
@@ -398,6 +411,14 @@ export class PageEditManager {
   private offMedia: (() => void) | null = null;
   private started = false;
   private destroyed = false;
+  /** Show when (D465): the moments; null = every non-load experience stays held. */
+  private moments: ShowWhenMoments | null = null;
+  private momentsUnsubscribe: (() => void) | null = null;
+  /** Experiences revealed in this page view. */
+  private revealed = new Set<string>();
+  /** The answer's `recheckOn`, and the events already re-checked in this page view. */
+  private recheckOn: string[] = [];
+  private rechecked = new Set<string>();
 
   constructor(
     private apiEndpoint: string,
@@ -427,6 +448,51 @@ export class PageEditManager {
         if (s.type === 'page_change' && this.started) this.loadPage();
       });
     }
+  }
+
+  /** Show when (D465): the SDK's moments. A held experience is applied as its moment comes. */
+  setShowWhen(moments: ShowWhenMoments | null): void {
+    this.momentsUnsubscribe?.();
+    this.moments = moments;
+    this.momentsUnsubscribe = moments ? moments.onChange(() => this.sweep()) : null;
+  }
+
+  /** Has this experience's moment come in this page view (it stays come)? An invalid one never. */
+  private due(x: PageEditExperienceWire): boolean {
+    const sw = parseShowWhen(x.showWhen);
+    return !!sw && (sw.kind === 'load' || this.revealed.has(x.id) || (!!this.moments && this.moments.met(sw)));
+  }
+
+  /** A moment may have come: apply the experiences now due. */
+  private sweep(): void {
+    if (!this.started || this.destroyed) return;
+    let any = false;
+    for (const x of this.experiences) {
+      if (this.revealed.has(x.wire.id) || !isDeferred(x.wire.showWhen) || !this.due(x.wire)) continue;
+      this.revealed.add(x.wire.id);
+      any = true;
+    }
+    if (any) this.applyAll();
+  }
+
+  /**
+   * Show when: should `eventName` ask again for this page now? Yes when the
+   * answer lists it in `recheckOn` or an experience waits on it, once per page
+   * view. Marks it as asked.
+   */
+  claimRecheck(eventName: string): boolean {
+    if (!this.moments || !this.started || this.destroyed || this.rechecked.has(eventName)) return false;
+    const waits =
+      this.recheckOn.includes(eventName) ||
+      this.experiences.some((x) => (parseShowWhen(x.wire.showWhen) as { event?: string } | null)?.event === eventName);
+    if (waits) this.rechecked.add(eventName);
+    return waits;
+  }
+
+  /** Ask again for the current page now (the show-when re-check), carrying the event that caused it. */
+  recheck(event?: RecheckEvent): void {
+    const url = this.url();
+    if (url && this.started && !this.destroyed) void this.fetch(url, this.generation, event);
   }
 
   /** Hide what was edited here last time, apply what is known, observe the DOM, ask the server. */
@@ -479,6 +545,7 @@ export class PageEditManager {
   destroy(): void {
     this.destroyed = true;
     this.pageUnsubscribe?.();
+    this.momentsUnsubscribe?.();
     this.offMedia?.();
     this.offMedia = null;
     this.observer?.disconnect();
@@ -506,6 +573,10 @@ export class PageEditManager {
   private loadPage(): void {
     const generation = ++this.generation;
     this.revertAll();
+    // A new page view: held experiences wait for this page's moment, events may re-check again.
+    this.revealed.clear();
+    this.rechecked.clear();
+    this.recheckOn = [];
     const url = this.url();
     if (!url) {
       this.experiences = [];
@@ -658,7 +729,7 @@ export class PageEditManager {
     return request;
   }
 
-  private async fetch(url: string, generation: number): Promise<void> {
+  private async fetch(url: string, generation: number, recheckEvent?: RecheckEvent): Promise<void> {
     const consent = this.runtime.consent();
     if (consent === null || this.destroyed) {
       this.showAll();
@@ -673,9 +744,10 @@ export class PageEditManager {
       ...(personal ? { sessionId: this.session.getSessionId() } : {}),
       deviceType: 'web',
       locale: typeof navigator !== 'undefined' ? navigator.language : undefined,
-      capabilities: [PAGE_CONTEXT_CAPABILITY, PAGE_EDITS_CAPABILITY, PAGE_EDIT_DEVICE_CAPABILITY],
+      capabilities: [PAGE_CONTEXT_CAPABILITY, PAGE_EDITS_CAPABILITY],
       trackingConsent: consent,
       context: this.page ? this.page.current() : { url, pageVariables: {}, dataLayer: {} },
+      ...(recheckEvent ? { recheckEvent } : {}),
     };
     const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
     const timeout = setTimeout(() => controller?.abort(), this.runtime.requestTimeoutMs ?? 10000);
@@ -704,6 +776,7 @@ export class PageEditManager {
         .map((wire) => ({ wire, edits: (Array.isArray(wire.edits) ? wire.edits : []).map(trustedEdit).filter((e): e is PageEditWire => !!e) }));
       this.revertAll();
       this.experiences = experiences;
+      this.recheckOn = eventNames(data.recheckOn);
       // The definitive answer: a server-applied edit it no longer carries is undone first.
       this.reconcileServer(experiences);
       this.remember(url, experiences, data.ttlSeconds);
@@ -735,6 +808,8 @@ export class PageEditManager {
     this.observer?.disconnect();
     try {
       for (const x of this.experiences) {
+        // Show when: held until its moment (treatment and control alike).
+        if (!this.due(x.wire)) continue;
         if (x.wire.isControl) {
           const seen = (x.wire.selectors || []).some((s) => isSafeSelector(s) && this.query(s).length > 0);
           if (seen) this.reportControl(x.wire);
@@ -892,7 +967,8 @@ export class PageEditManager {
 
   private remember(url: string, experiences: Experience[], ttlSeconds?: number): void {
     // Held back next time: only what this viewport shows.
-    const selectors = [...new Set(experiences.flatMap((x) => (x.wire.isControl ? [] : x.edits.filter((e) => editShowsOn(e, this.mobile)).map((e) => e.selector))))];
+    // Never an experience that waits for a moment: it shows the original until then.
+    const selectors = [...new Set(experiences.flatMap((x) => (x.wire.isControl || isDeferred(x.wire.showWhen) ? [] : x.edits.filter((e) => editShowsOn(e, this.mobile)).map((e) => e.selector))))];
     try {
       const all = JSON.parse(localStorage.getItem(this.stores.selectors) || '{}') || {};
       delete all[url];
@@ -989,7 +1065,8 @@ export class PageEditManager {
     if (!server.size || typeof document === 'undefined') return;
     const keep = new Set<string>();
     for (const x of experiences) {
-      if (x.wire.isControl) continue;
+      // A control, or an experience that now waits for a moment: its server-applied edits go (applied by the SDK at the moment).
+      if (x.wire.isControl || isDeferred(x.wire.showWhen)) continue;
       for (const e of x.edits) {
         const token = `${x.wire.id}:${e.id}`;
         const s = server.get(token);

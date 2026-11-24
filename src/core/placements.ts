@@ -30,16 +30,34 @@
  *   delivery token, and the SDK reports nothing.
  * - HTML items render in the same sandboxed, nonce-CSP frame as overlays, and
  *   only when `allowHtmlJsInAppMessages` is on.
+ * - Show when (D465, show-when.ts): an item with a `showWhen` other than load
+ *   is held - neither drawn nor handed to the data API - until its moment in
+ *   this page view, then the key's spots re-draw and onPlacementsUpdated
+ *   fires; a route change holds it again until the new page's moment. A
+ *   control answer's `showWhen` delays its exposure the same way, and
+ *   `deferredControls` are reported once their own moment has come and the
+ *   spot was viewable. An event named in `recheckOn` (or one an item waits
+ *   on) re-fetches the key at once, past the 30 s limit, once per page view.
+ * - Server-filled slots (D466): a store plugin may write a slot's
+ *   content into the HTML when Joryio's answer for it is the same for every
+ *   visitor (`data-joryio-server-filled` on the slot, the fill inside it, the
+ *   marker block's `fills`). The SDK keeps that drawing when the visitor's own
+ *   answer is the same campaign, variant and products - no redraw - and
+ *   reports its impression with the visitor's own token once it is viewable
+ *   (nothing without consent, as for every item); otherwise it replaces it
+ *   with the visitor's answer, or removes it per the empty behaviour.
  */
 
 import { JoryioSubscription, joryioSubscription } from './subscription';
 import { bucketHash } from '../utils/bucket-hash';
 import { currentPageUrl, PAGE_CONTEXT_CAPABILITY, type PageContextTracker } from './page-context';
 import { Logger } from '../utils/logger';
+import { eventNames, isDeferred, parseShowWhen, type RecheckEvent, type ShowWhenMoments } from './show-when';
 import { sdkIdentityHeaders } from './config';
 import { IdentityManager } from './identity';
 import { SessionManager } from './session';
 import type { LinkContext, LinkRouter } from './links';
+import { serverMarkerElement } from './page-edits';
 import {
   buildInAppSrcdoc,
   inAppTriggerFilterMatches,
@@ -71,6 +89,24 @@ export const PLACEMENT_PRODUCT_CARD_WIDTH = 160;
 export function placementProductElementId(productId: string): string {
   return `${PLACEMENT_PRODUCT_ELEMENT_PREFIX}${productId}`.slice(0, 128);
 }
+/**
+ * Server-filled slots (D466; backend common/placements/server-slot-fills.ts,
+ * the plugins' shared core). Same names and values pinned by
+ * server-slot-fills-sdk-parity.spec.ts.
+ */
+export const SERVER_FILLED_ATTR = 'data-joryio-server-filled';
+export const SERVER_FILL_ATTR = 'data-joryio-server-fill';
+export const SERVER_FILLS_MARKER_KEY = 'fills';
+
+/** One slot the store's server filled: what it drew, from the marker. */
+interface ServerFill {
+  campaignId: string;
+  variantId: string;
+  products: string[];
+  /** The fill's `.joryio-placement` wrapper inside the slot. */
+  wrapper: HTMLElement;
+}
+
 /** Used when an answer carries no ttlSeconds. */
 const DEFAULT_TTL_SECONDS = 300;
 /** The pre-scoping, origin-wide name - never read, removed on start. */
@@ -129,6 +165,8 @@ export interface PlacementItemWire {
   expiresAt?: string | null;
   /** Echoed in `shown` when present; the item id otherwise. */
   deliveryId?: string | null;
+  /** Show when (D465): the item's moment; absent = on load. */
+  showWhen?: unknown;
 }
 
 /** One placement as the server sends it. */
@@ -146,6 +184,12 @@ export interface PlacementWire {
    * and asked again on a route change.
    */
   pageScoped?: boolean;
+  /** Show when (D465), on a control answer only: the moment the held-out treatment would have shown. */
+  showWhen?: unknown;
+  /** Control exposures to report once their moment came and the spot was viewable. */
+  deferredControls?: Array<{ controlToken: string; showWhen: unknown }>;
+  /** Event names that re-fetch this key at once when tracked. */
+  recheckOn?: string[];
 }
 
 export interface PlacementsResponse {
@@ -267,6 +311,8 @@ interface Mount {
   hostObserver: IntersectionObserver | null;
   trackers: ViewTracker[];
   frameIds: string[];
+  /** D466: the store's server drew this slot; kept or replaced once the visitor's answer is known. */
+  serverFill: ServerFill | null;
 }
 
 const nowMs = () => Date.now();
@@ -419,6 +465,17 @@ export class PlacementManager {
   private destroyed = false;
   private page: PageContextTracker | null = null;
   private pageUnsubscribe: (() => void) | null = null;
+  /** Show when (D465): the moments; null = this manager holds every non-load item for good. */
+  private moments: ShowWhenMoments | null = null;
+  private momentsUnsubscribe: (() => void) | null = null;
+  /** Held items / control answers revealed in this page view (handles; `ctl:` + token for a control). */
+  private revealed = new Set<string>();
+  /** Keys whose spot was viewable in this page view (drawn item, control spot, or markDisplayed). */
+  private spotViewable = new Set<string>();
+  /** `key + event` re-checked in this page view. */
+  private rechecked = new Set<string>();
+  /** The event the next batch re-checks for (only a re-check request carries it). */
+  private recheckEvent: RecheckEvent | null = null;
 
   constructor(
     private apiEndpoint: string,
@@ -460,6 +517,7 @@ export class PlacementManager {
       hostObserver: null,
       trackers: [],
       frameIds: [],
+      serverFill: this.serverFillOf(key, element),
     };
     this.mounts.add(mount);
     this.observeHost(mount);
@@ -543,6 +601,8 @@ export class PlacementManager {
     this.triggeredAt.clear();
     this.dismissedLocally.clear();
     this.reported.clear();
+    this.revealed.clear();
+    this.spotViewable.clear();
     this.persistCache();
     const keys = this.mountedKeys();
     // The previous person's content goes NOW, on screen or not: it must not
@@ -555,6 +615,8 @@ export class PlacementManager {
     this.destroyed = true;
     this.pageUnsubscribe?.();
     this.pageUnsubscribe = null;
+    this.momentsUnsubscribe?.();
+    this.momentsUnsubscribe = null;
     for (const mount of Array.from(this.mounts)) this.unmount(mount);
     this.mutationObserver?.disconnect();
     this.mutationObserver = null;
@@ -608,10 +670,21 @@ export class PlacementManager {
     if (!tracker) return;
     this.pageUnsubscribe = tracker.onSignal((signal) => {
       if (signal.type !== 'page_change' || this.destroyed) return;
+      // Show when: a new page view - held items wait for this page's moment again.
+      const held = this.revealed.size ? this.keysWithMoments() : [];
+      this.revealed.clear();
+      this.spotViewable.clear();
+      this.rechecked.clear();
       const stale: string[] = [];
       this.cache.forEach((entry, key) => {
         if (entry.placement.pageScoped && entry.url !== signal.url) stale.push(key);
       });
+      const rehide = held.filter((key) => !stale.includes(key));
+      if (rehide.length) {
+        for (const mount of this.mounts) if (rehide.includes(mount.key)) this.render(mount);
+        this.notify(rehide);
+        this.sweep();
+      }
       if (!stale.length) return;
       stale.forEach((key) => this.cache.delete(key));
       this.persistCache();
@@ -626,6 +699,88 @@ export class PlacementManager {
           .catch(() => undefined);
       }
     });
+  }
+
+  /** Show when (D465): the SDK's moments. Held content is revealed as they come. */
+  setShowWhen(moments: ShowWhenMoments | null): void {
+    this.momentsUnsubscribe?.();
+    this.moments = moments;
+    this.momentsUnsubscribe = moments ? moments.onChange(() => !this.destroyed && this.sweep()) : null;
+  }
+
+  /** Has this held content's moment come in this page view? Once yes, it stays yes until a route change. */
+  private due(handle: string, raw: unknown): boolean {
+    const sw = parseShowWhen(raw);
+    if (!sw) return false;
+    return sw.kind === 'load' || this.revealed.has(handle) || (!!this.moments && this.moments.met(sw));
+  }
+
+  /** Keys whose answer holds anything until a moment. */
+  private keysWithMoments(): string[] {
+    const out: string[] = [];
+    this.cache.forEach((entry, key) => {
+      const p = entry.placement;
+      if (p.showWhen !== undefined || p.deferredControls?.length || (p.items || []).some((i) => i.showWhen !== undefined)) out.push(key);
+    });
+    return out;
+  }
+
+  /**
+   * A moment may have come: reveal held items and control answers whose moment
+   * did (re-draw + onPlacementsUpdated), and report the deferred control
+   * exposures that are now due.
+   */
+  private sweep(): void {
+    const changed: string[] = [];
+    this.cache.forEach((entry, key) => {
+      const p = entry.placement;
+      const handles: Array<[string, unknown]> = (p.items || []).filter((i) => isDeferred(i.showWhen)).map((i) => [this.handle(key, i), i.showWhen]);
+      if (p.isControl && isDeferred(p.showWhen)) handles.push([`ctl:${key}:${p.controlToken || ''}`, p.showWhen]);
+      for (const [h, raw] of handles) {
+        if (this.revealed.has(h) || !this.due(h, raw)) continue;
+        this.revealed.add(h);
+        if (!changed.includes(key)) changed.push(key);
+      }
+      this.reportDeferred(key);
+    });
+    if (changed.length) this.applyChanged(changed);
+  }
+
+  /**
+   * Show when: the keys to ask again now that `eventName` was tracked - their
+   * answer lists it in `recheckOn` or holds an item waiting on it - at most
+   * once per (key, event) per page view. Marks them as asked.
+   */
+  recheckKeysFor(eventName: string): string[] {
+    if (!this.moments || this.destroyed) return [];
+    const out: string[] = [];
+    this.cache.forEach((entry, key) => {
+      const p = entry.placement;
+      if (p.pageScoped && entry.url !== this.currentUrl()) return;
+      const waits =
+        (p.recheckOn || []).includes(eventName) ||
+        (p.items || []).some((i) => (parseShowWhen(i.showWhen) as { event?: string } | null)?.event === eventName);
+      const once = `${key}\u0000${eventName}`;
+      if (!waits || this.rechecked.has(once)) return;
+      this.rechecked.add(once);
+      out.push(key);
+    });
+    return out;
+  }
+
+  /**
+   * Ask the server again for `keys` now, past the client refresh limit (the
+   * show-when re-check), carrying the event that caused it (`recheckEvent`).
+   */
+  recheck(keys: string[], event?: RecheckEvent): Promise<void> {
+    const go = (): Promise<void> => {
+      keys.forEach((key) => this.lastNetworkAt.delete(this.rateKey(key)));
+      if (event) this.recheckEvent = event;
+      return this.fetchKeys(keys, false);
+    };
+    // A request already on its way may predate the event: ask again once it is back.
+    const inflight = keys.map((key) => this.inflight.get(key)).filter(Boolean);
+    return (inflight.length ? Promise.all(inflight).then(go) : go()).catch(() => undefined);
   }
 
   private currentUrl(): string | null {
@@ -705,19 +860,21 @@ export class PlacementManager {
     this.batchKeys.clear();
     const waiters = this.batchWaiters;
     this.batchWaiters = [];
+    const recheckEvent = this.recheckEvent;
+    this.recheckEvent = null;
     const chunks: string[][] = [];
     for (let i = 0; i < keys.length; i += PLACEMENT_MAX_KEYS_PER_REQUEST) {
       chunks.push(keys.slice(i, i + PLACEMENT_MAX_KEYS_PER_REQUEST));
     }
     try {
-      await Promise.all(chunks.map((chunk) => this.request(chunk)));
+      await Promise.all(chunks.map((chunk) => this.request(chunk, recheckEvent)));
     } finally {
       keys.forEach((key) => this.inflight.delete(key));
       waiters.forEach((w) => w.resolve());
     }
   }
 
-  private async request(keys: string[]): Promise<void> {
+  private async request(keys: string[], recheckEvent?: RecheckEvent | null): Promise<void> {
     const consent = this.runtime.consent();
     if (consent === null || this.destroyed) return;
     const generation = this.generation;
@@ -743,6 +900,7 @@ export class PlacementManager {
       placements: keys,
       shown,
       context: this.page ? { ...this.page.current(), screen: null } : pageContext(),
+      ...(recheckEvent ? { recheckEvent } : {}),
     };
 
     const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
@@ -818,6 +976,11 @@ export class PlacementManager {
       controlToken: wire.controlToken || null,
       items,
       ...(wire.pageScoped === true ? { pageScoped: true } : {}),
+      ...(wire.isControl === true && wire.showWhen != null ? { showWhen: wire.showWhen } : {}),
+      ...(Array.isArray(wire.deferredControls) && wire.deferredControls.length
+        ? { deferredControls: wire.deferredControls.filter((d) => d && typeof d.controlToken === 'string' && d.controlToken) }
+        : {}),
+      ...(eventNames(wire.recheckOn).length ? { recheckOn: eventNames(wire.recheckOn) } : {}),
     };
   }
 
@@ -829,6 +992,10 @@ export class PlacementManager {
       if (mount.hostInView && mount.shown.length) mount.pendingUpdate = true;
       else this.render(mount);
     }
+    this.notify(keys);
+  }
+
+  private notify(keys: string[]): void {
     if (!this.listeners.size) return;
     const update: Record<string, Placement> = {};
     keys.forEach((key) => (update[key] = this.toPlacement(key)));
@@ -857,6 +1024,8 @@ export class PlacementManager {
       .filter((item) => {
         if (item.expiresAt && Date.parse(item.expiresAt) <= now) return false;
         if (this.dismissedLocally.has(this.handle(key, item))) return false;
+        // Show when: held until its moment in this page view; an unknown or invalid moment is never shown.
+        if (item.showWhen !== undefined && !this.due(this.handle(key, item), item.showWhen)) return false;
         const eventTriggers = (item.triggers || []).filter((t) => t.type === 'event');
         if (eventTriggers.length) {
           const at = this.triggeredAt.get(this.handle(key, item));
@@ -879,7 +1048,11 @@ export class PlacementManager {
       emptyBehavior: wire.emptyBehavior || 'collapse',
       maxItems: wire.maxItems || 1,
       ttlSeconds: wire.ttlSeconds || DEFAULT_TTL_SECONDS,
-      markDisplayed: () => this.current(generation) && this.reportControl(key),
+      markDisplayed: () => {
+        if (!this.current(generation)) return;
+        this.reportControl(key);
+        this.markSpotViewable(key);
+      },
     };
   }
 
@@ -919,6 +1092,7 @@ export class PlacementManager {
    * as displayed - the person saw it.
    */
   private report(key: string, item: PlacementItemWire, type: 'displayed' | 'clicked' | 'dismissed', elementId?: string): void {
+    if (type === 'displayed') this.markSpotViewable(key);
     if (this.runtime.consent() !== 'granted') return;
     const once = `${type}:${this.handle(key, item)}`;
     if (type !== 'clicked') {
@@ -951,13 +1125,35 @@ export class PlacementManager {
   private reportControl(key: string): void {
     const entry = this.cache.get(key);
     if (!entry?.placement.isControl || !entry.placement.controlToken) return;
+    // Show when: not before the moment the treatment would have shown (the spot re-draws, and
+    // onPlacementsUpdated fires, at that moment - a markDisplayed before it is ignored).
+    if (!this.due(`ctl:${key}:${entry.placement.controlToken}`, entry.placement.showWhen)) return;
+    this.postControl(key, entry.placement.controlToken);
+  }
+
+  /** The spot of `key` was viewable in this page view: deferred control exposures may now be due. */
+  private markSpotViewable(key: string): void {
+    if (this.spotViewable.has(key)) return;
+    this.spotViewable.add(key);
+    this.reportDeferred(key);
+  }
+
+  /** `deferredControls` of the answer: each once, after its own moment, once the spot was viewable in this page view. */
+  private reportDeferred(key: string): void {
+    const list = this.cache.get(key)?.placement.deferredControls;
+    if (!list?.length || !this.spotViewable.has(key)) return;
+    for (const d of list) if (this.due(`ctl:${key}:${d.controlToken}`, d.showWhen)) this.postControl(key, d.controlToken);
+  }
+
+  /** `in_app.control_viewed`, once per control token, with consent only. */
+  private postControl(key: string, controlToken: string): void {
     if (this.runtime.consent() !== 'granted') return;
-    const once = `control:${entry.placement.controlToken}`;
+    const once = `control:${controlToken}`;
     if (this.reported.has(once)) return;
     this.reported.add(once);
     this.post('/v1/in-app/track', {
       action: 'control_viewed',
-      controlToken: entry.placement.controlToken,
+      controlToken,
       placementKey: key,
       ...this.subject(),
       sessionId: this.session.getSessionId(),
@@ -1020,6 +1216,11 @@ export class PlacementManager {
   }
 
   private clearDrawn(mount: Mount): void {
+    if (mount.serverFill) {
+      // A server drawing never settled (removed before any answer): it goes with the mount.
+      this.dropServerFill(mount.element, mount.serverFill.wrapper);
+      mount.serverFill = null;
+    }
     mount.frameIds.forEach((id) => this.frames.delete(id));
     mount.frameIds = [];
     mount.wrapper?.remove();
@@ -1027,8 +1228,152 @@ export class PlacementManager {
     mount.shown = [];
   }
 
+  /** The marker block's fills by key (read once per page load; the plugin writes it before any script). */
+  private markerFills: Map<string, { campaignId: string; variantId: string; products: string[] }> | null = null;
+
+  private serverFillsOfMarker(): Map<string, { campaignId: string; variantId: string; products: string[] }> {
+    if (this.markerFills) return this.markerFills;
+    const out = new Map<string, { campaignId: string; variantId: string; products: string[] }>();
+    try {
+      const el = typeof document !== 'undefined' ? serverMarkerElement() : null;
+      const data = el ? JSON.parse(el.textContent || 'null') : null;
+      const list = data && data.v === 1 && Array.isArray(data[SERVER_FILLS_MARKER_KEY]) ? data[SERVER_FILLS_MARKER_KEY] : [];
+      for (const f of list.slice(0, 20)) {
+        if (!f || !validKey(f.placementKey) || typeof f.campaignId !== 'string' || !f.campaignId) continue;
+        const products = Array.isArray(f.products) ? f.products.filter((p: unknown) => typeof p === 'string').slice(0, 24) : [];
+        out.set(f.placementKey, { campaignId: f.campaignId, variantId: typeof f.variantId === 'string' ? f.variantId : '', products });
+      }
+    } catch {
+      // A broken marker: no slot is treated as server-filled (their content is replaced below).
+    }
+    this.markerFills = out;
+    return out;
+  }
+
+  /**
+   * The server's drawing in a slot element, when the element, its fill and
+   * the marker block agree on placement, campaign and variant. A fill they do
+   * not agree on (or one this SDK may not show: HTML with
+   * allowHtmlJsInAppMessages off) is removed at once and the slot is drawn
+   * as any other.
+   */
+  private serverFillOf(key: string, element: HTMLElement): ServerFill | null {
+    const token = element.getAttribute?.(SERVER_FILLED_ATTR);
+    if (!token) return null;
+    const wrapper = Array.from(element.children || []).find(
+      (c) => (c as HTMLElement).classList?.contains('joryio-placement') && c.hasAttribute?.(SERVER_FILL_ATTR),
+    ) as HTMLElement | undefined;
+    const fill = this.serverFillsOfMarker().get(key);
+    const ok =
+      !!wrapper &&
+      !!fill &&
+      wrapper.getAttribute(SERVER_FILL_ATTR) === token &&
+      token === `${key}:${fill.campaignId}:${fill.variantId}` &&
+      (this.runtime.allowHtml() || !wrapper.querySelector('.joryio-placement-html'));
+    if (!ok) {
+      this.dropServerFill(element, wrapper ?? null);
+      return null;
+    }
+    attachServerShadowRoots(wrapper!);
+    return { ...fill!, wrapper: wrapper! };
+  }
+
+  private dropServerFill(element: HTMLElement, wrapper: HTMLElement | null): void {
+    wrapper?.remove();
+    element.removeAttribute?.(SERVER_FILLED_ATTR);
+    element.removeAttribute?.('data-joryio-placement-state');
+  }
+
+  /**
+   * The slot was filled by the store's server: keep that drawing when this
+   * visitor's answer is the same campaign, variant and products (no redraw),
+   * else drop it. True when it was kept. Before any answer it stays as it is.
+   */
+  private settleServerFill(mount: Mount): 'kept' | 'dropped' | 'waiting' {
+    const sf = mount.serverFill;
+    if (!sf) return 'dropped';
+    const entry = this.cache.get(mount.key);
+    if (!entry) return 'waiting';
+    mount.serverFill = null;
+    const items = this.visibleItems(mount.key);
+    const item = items[0];
+    const products = toProducts(item?.products).map((p) => p.id);
+    const html = !!sf.wrapper.querySelector('.joryio-placement-html');
+    const same =
+      items.length === 1 &&
+      entry.placement.isControl !== true &&
+      item.id === sf.campaignId &&
+      (item.variantId ?? '') === sf.variantId &&
+      products.length === sf.products.length &&
+      products.every((id, i) => id === sf.products[i]) &&
+      (item.content?.kind === 'html') === html &&
+      (!html || this.runtime.allowHtml()) &&
+      (mount.options.showProducts !== false || !products.length);
+    if (!same) {
+      this.dropServerFill(mount.element, sf.wrapper);
+      return 'dropped';
+    }
+    mount.pendingUpdate = false;
+    this.clearTrackers(mount);
+    mount.wrapper = sf.wrapper;
+    mount.shown = [item.deliveryId || item.id];
+    mount.element.setAttribute('data-joryio-placement-state', 'filled');
+    const node = (sf.wrapper.firstElementChild as HTMLElement | null) || sf.wrapper;
+    this.trackViewability(mount, node, () => this.report(mount.key, item, 'displayed'));
+    this.bindServerFill(mount, sf.wrapper, item);
+    if (mount.options.onRender) {
+      try {
+        mount.options.onRender(this.toPlacement(mount.key), mount.element);
+      } catch (error) {
+        this.logger.error('The insertPlacement onRender callback threw; ignored:', error);
+      }
+    }
+    return 'kept';
+  }
+
+  /**
+   * Clicks in a kept server drawing, with the SDK's own rules: a product card
+   * reports `clicked` with placementProductElementId and opens through the
+   * link router in a new tab; in HTML content an <a> or <button> reports the
+   * frame's `link_click` / `cta_click` (or its data-action) and an http(s)
+   * link opens in a new tab - inline content never navigates the page it
+   * sits in. #anchors, mailto:, tel: and sms: are left to the browser.
+   */
+  private bindServerFill(mount: Mount, wrapper: HTMLElement, item: PlacementItemWire): void {
+    wrapper.addEventListener(
+      'click',
+      (event: Event) => {
+        if (!this.mounts.has(mount) || mount.wrapper !== wrapper) return;
+        const path = (typeof (event as any).composedPath === 'function' ? (event as any).composedPath() : [event.target]) as Element[];
+        for (const el of path) {
+          if (!el || el === wrapper || typeof (el as Element).getAttribute !== 'function') break;
+          const productId = el.getAttribute('data-joryio-product');
+          if (productId) {
+            const href = el.getAttribute('href');
+            if (href) event.preventDefault?.();
+            this.buttonAction(mount, item, { id: placementProductElementId(productId), action: 'deep_link', url: href || undefined });
+            return;
+          }
+          const tag = (el.tagName || '').toUpperCase();
+          if (tag === 'A' || tag === 'BUTTON') {
+            const href = tag === 'A' ? el.getAttribute('href') : null;
+            if (hasUserGesture()) this.report(mount.key, item, 'clicked', el.getAttribute('data-action') || (href ? 'link_click' : 'cta_click'));
+            if (href && !/^(#|mailto:|tel:|sms:)/i.test(href.trim())) {
+              event.preventDefault?.();
+              const safe = safeHttpUrl(href.trim());
+              if (safe && hasUserGesture()) this.openLink(safe, { placementKey: mount.key, itemId: item.id }, () => window.open(safe, '_blank', 'noopener'));
+            }
+            return;
+          }
+        }
+      },
+      true,
+    );
+  }
+
   private render(mount: Mount): void {
     if (!this.mounts.has(mount)) return;
+    if (mount.serverFill && this.settleServerFill(mount) !== 'dropped') return;
     mount.pendingUpdate = false;
     this.clearTrackers(mount);
     this.clearDrawn(mount);
@@ -1056,7 +1401,10 @@ export class PlacementManager {
       wrapper.style.display = placement.emptyBehavior === 'keep_space' ? '' : 'none';
       if (placement.isControl && entry?.placement.controlToken) {
         // The holdout's exposure: the SPOT (the site's element) was viewable.
-        this.trackViewability(mount, mount.element, () => this.reportControl(mount.key));
+        this.trackViewability(mount, mount.element, () => {
+          this.reportControl(mount.key);
+          this.markSpotViewable(mount.key);
+        });
       }
     }
     if (mount.options.onRender) {
@@ -1417,6 +1765,25 @@ export class PlacementManager {
 }
 
 /** The wire's product cards, defensively typed: an entry without an id is dropped. */
+/**
+ * A browser without declarative shadow DOM leaves the server's
+ * `<template shadowrootmode="open">` inert: attach it here, as the parser
+ * would have (D466).
+ */
+export function attachServerShadowRoots(wrapper: HTMLElement): void {
+  for (const host of Array.from(wrapper.querySelectorAll?.('.joryio-placement-html') || []) as HTMLElement[]) {
+    if (host.shadowRoot || typeof host.attachShadow !== 'function') continue;
+    const tpl = Array.from(host.children).find((c) => c.tagName === 'TEMPLATE' && c.getAttribute('shadowrootmode') === 'open') as HTMLTemplateElement | undefined;
+    if (!tpl) continue;
+    try {
+      host.attachShadow({ mode: 'open' }).appendChild(tpl.content);
+      tpl.remove();
+    } catch {
+      // Left as it is: the template stays inert.
+    }
+  }
+}
+
 export function toProducts(raw: unknown): PlacementProduct[] {
   if (!Array.isArray(raw)) return [];
   const str = (v: unknown) => (typeof v === 'string' ? v : null);

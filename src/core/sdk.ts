@@ -6,6 +6,7 @@
 import { PageEditManager } from './page-edits';
 import { EditorGate, editorFrame, editorRequested } from './editor-gate';
 import { PageContextTracker } from './page-context';
+import { ShowWhenMoments, type RecheckEvent } from './show-when';
 import { InitConfig, ResolvedConfig, resolveConfig, SDK_VERSION } from './config';
 import { StorageManager } from './storage';
 import { SessionManager, SESSION_ID_KEY } from './session';
@@ -269,6 +270,10 @@ export class JoryioSDK {
   // Created with the instance, so setLinkHandler works before init().
   private links = new LinkRouter((error) => this.logger?.error('Your link handler threw; the link opens as without one:', error));
   private pageContext!: PageContextTracker;
+  /** Show when (D465): this page view's moments and this visit's event names, for placements and page edits. */
+  private showWhen!: ShowWhenMoments;
+  /** Show when re-checks waiting for their event to reach the server (see recheckShowWhen). */
+  private pendingRechecks: Array<{ event: RecheckEvent; keys: string[]; edits: boolean; who: string; at: number }> = [];
   private pageEdits!: PageEditManager;
   private editor: EditorGate | null = null;
   /** Feature flags + remote config (flags.ts). */
@@ -558,6 +563,11 @@ export class JoryioSDK {
     // UTM page rules (D444 Phase 4 follow-up): the UTM this SDK already recorded, when capture is on.
     this.pageContext.setUtmSource(() => (this.config.captureUTM && this.utm ? this.utm.getUTMData() : null));
     this.inapp.setPageContext(this.pageContext);
+    this.showWhen = new ShowWhenMoments(this.pageContext, () => this.session.getSessionId(), this.config.sdkKey);
+    // A re-check belongs to its page view: a route change drops the waiting ones.
+    this.pageContext.onSignal((s) => {
+      if (s.type === 'page_change') this.pendingRechecks = [];
+    });
 
     this.placements = new PlacementManager(
       this.config.apiEndpoint,
@@ -582,6 +592,7 @@ export class JoryioSDK {
       this.network,
     );
     this.placements.setPageContext(this.pageContext);
+    this.placements.setShowWhen(this.showWhen);
 
     // Page edits (D444 Phase 4): selector edits from page-edit campaigns.
     this.pageEdits = new PageEditManager(
@@ -598,6 +609,7 @@ export class JoryioSDK {
       this.network,
     );
     this.pageEdits.setPageContext(this.pageContext);
+    this.pageEdits.setShowWhen(this.showWhen);
 
     this.cards = new CardManager(
       this.config.apiEndpoint,
@@ -681,6 +693,8 @@ export class JoryioSDK {
       try {
         return await this.flushEvents(events, identify);
       } finally {
+        // A batch settled: re-checks whose event has now left the queue go (after the queue's own bookkeeping).
+        if (this.pendingRechecks.length) setTimeout(() => this.runRechecks(), 0);
         // A logged-out user's token lives as long as their leftovers (D-a).
         this.scheduleRetiredTokenPrune();
       }
@@ -1081,6 +1095,7 @@ export class JoryioSDK {
         this.network.switchUser(userId);
         this.identity.adopt(anonymousId, userId);
         this.placements.invalidate();
+        this.pendingRechecks = []; // never run a re-check queued for another person or consent
         // Another person: the anonymous visitor's card state goes too.
         this.cards.invalidate(true);
         this.pageEdits?.invalidate();
@@ -1475,6 +1490,7 @@ export class JoryioSDK {
       // Placement answers too: a grant turns generic answers personal, a
       // refusal turns personal answers generic.
       this.placements?.invalidate();
+      this.pendingRechecks = []; // never run a re-check queued for another person or consent
       // The card feed is asked for only with consent: a grant fetches it, a refusal empties it.
       this.cards?.invalidate(false);
       // Consent changed: the stored site settings go too (as every per-workspace store).
@@ -1875,6 +1891,9 @@ export class JoryioSDK {
         try {
           this.inapp?.onEventTracked(eventName, eventProperties);
           this.placements?.onEventTracked(eventName, eventProperties);
+          // Show when: content held for this event shows now, and the answers that depend on it are asked again.
+          this.showWhen?.noteEvent(eventName);
+          this.recheckShowWhen(eventName, processedEvent);
         } catch (error) {
           this.logger.error('In-app trigger evaluation failed:', error);
         }
@@ -1898,6 +1917,57 @@ export class JoryioSDK {
     } catch (error) {
       // Never throw into the host page.
       this.logger.error('track() failed:', error);
+    }
+  }
+
+  /**
+   * Show when (D465): `eventName` was tracked and an answer depends on it
+   * (`recheckOn`, or held content waiting on it). The re-check never reaches
+   * the server before the event: the queue is flushed (after any flush in
+   * progress), and those placement keys and this page's edits are asked again
+   * only once the event has left the queue - delivered - past the 30 s
+   * placement limit, once per (key or page, event) per page view. A failed
+   * flush keeps it waiting; it runs once, after the next flush that delivers
+   * the event. The request carries the event (`recheckEvent`), so the server
+   * counts it even before its own write of the event lands.
+   */
+  private recheckShowWhen(eventName: string, queued: QueuedEvent): void {
+    const keys = this.placements?.recheckKeysFor(eventName) || [];
+    const edits = !!this.pageEdits?.claimRecheck(eventName);
+    if (!keys.length && !edits) return;
+    const event: RecheckEvent = { name: eventName, eventId: queued.eventId, properties: { ...(queued.properties || {}) } };
+    // Stamped with who it is for (identity, consent, page); at most 20, the oldest dropped.
+    this.pendingRechecks.push({ event, keys, edits, who: this.recheckOwner(), at: Date.now() });
+    if (this.pendingRechecks.length > 20) this.pendingRechecks.shift();
+    void this.queue
+      .flush(false, true)
+      .catch(() => undefined)
+      .then(() => this.runRechecks());
+  }
+
+  /** Who a re-check is for: the visitor, the consent and the page it was queued on. */
+  private recheckOwner(): string {
+    return [this.identity.getUserId() || '', this.identity.getAnonymousId(), this.placementConsent() || '', this.pageContext?.current().url || ''].join('\u0000');
+  }
+
+  /**
+   * Run the waiting re-checks whose event is no longer queued or in flight.
+   * One queued for another person, consent or page, or older than 60 s, is
+   * dropped - its event (and properties) never ride on someone else's request.
+   */
+  private runRechecks(): void {
+    if (!this.pendingRechecks.length || !this.isInitialized) return;
+    const owner = this.recheckOwner();
+    const now = Date.now();
+    this.pendingRechecks = this.pendingRechecks.filter((r) => r.who === owner && now - r.at <= 60_000);
+    const waiting = new Set([...this.queue.getQueuedEvents(), ...this.queue.getInflightEvents()].map((e) => e.eventId));
+    const due = this.pendingRechecks.filter((r) => !waiting.has(r.event.eventId));
+    if (!due.length) return;
+    this.pendingRechecks = this.pendingRechecks.filter((r) => waiting.has(r.event.eventId));
+    if (!this.canSend()) return;
+    for (const r of due) {
+      if (r.keys.length) void this.placements.recheck(r.keys, r.event);
+      if (r.edits) this.pageEdits.recheck(r.event);
     }
   }
 
@@ -1954,6 +2024,7 @@ export class JoryioSDK {
     if (previousUserId !== userId) {
       this.inapp.invalidate();
       this.placements.invalidate();
+      this.pendingRechecks = []; // never run a re-check queued for another person or consent
       this.cards.invalidate(true);
       this.pageEdits?.invalidate();
       this.flags.onIdentityChanged();
@@ -2521,6 +2592,7 @@ export class JoryioSDK {
     this.flags.onIdentityChanged();
     this.network.setCurrentUserId(this.identity.getUserId());
     this.placements.invalidate();
+    this.pendingRechecks = []; // never run a re-check queued for another person or consent
     this.cards.invalidate(true);
     // reset / resetTo: the stored site settings go too (identify keeps them - the same for every visitor).
     this.pageEdits?.invalidate({ siteSettings: true });
@@ -2633,6 +2705,7 @@ export class JoryioSDK {
     this.flags.onIdentityChanged();
     this.network.setCurrentUserId(null);
     this.placements.invalidate();
+    this.pendingRechecks = []; // never run a re-check queued for another person or consent
     this.cards?.invalidate(true);
     this.pageEdits?.invalidate({ siteSettings: true });
     this.utm.reset();
@@ -3693,6 +3766,8 @@ export class JoryioSDK {
     this.cards.destroy();
     this.pageEdits?.destroy();
     this.editor?.stop();
+    this.showWhen?.destroy();
+    this.pendingRechecks = [];
     this.pageContext?.destroy();
     this.flags.destroy();
 

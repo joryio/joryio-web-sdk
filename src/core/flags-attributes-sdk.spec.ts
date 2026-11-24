@@ -53,4 +53,41 @@ describe('flags carry the attributes set on this device', () => {
     await settle(50);
     expect(evaluates().pop()!.body.attributes).toEqual({});
   });
+
+  /**
+   * 1.4.0-beta.10 test: identify(A) + setAttributes, then identify(B) of a
+   * DIFFERENT user: B's first evaluate carried A's attributes, and A's `seats` /
+   * `ratio` stayed in all of B's. As on iOS: B starts with none, then only B's
+   * own; the same user again keeps them; reset() clears them.
+   */
+  it('identify of a different user drops the previous user\'s attributes before any request for them', async () => {
+    sdk = new JoryioSDK({ ...BASE_CONFIG, trackingConsent: 'granted' } as any);
+    sdk.identify('user-a');
+    sdk.setAttributes({ plan: 'pro', seats: 10, ratio: 2.5 });
+    await sdk.refreshFlags();
+    expect(evaluates().pop()!.body.attributes).toEqual({ plan: 'pro', seats: 10, ratio: 2.5 });
+
+    const before = calls.length;
+    sdk.identify('user-b');
+    await settle(20);
+    const firstForB = evaluates().find((c) => calls.indexOf(c) >= before && c.body.userId === 'user-b');
+    expect(firstForB?.body.attributes).toEqual({});
+    sdk.setAttributes({ plan: 'free' });
+    await sdk.refreshFlags();
+    expect(evaluates().pop()!.body.attributes).toEqual({ plan: 'free' });
+    // No request made for B carries any of A's attributes.
+    for (const c of calls.slice(before)) {
+      const body: any = c.body;
+      if (!body || body.userId !== 'user-b') continue;
+      for (const bag of [body.attributes, body.userAttributes].filter(Boolean)) {
+        expect(Object.keys(bag)).not.toContain('seats');
+        expect(Object.keys(bag)).not.toContain('ratio');
+      }
+    }
+
+    // The same user again: kept.
+    sdk.identify('user-b');
+    await sdk.refreshFlags();
+    expect(evaluates().pop()!.body.attributes).toEqual({ plan: 'free' });
+  });
 });

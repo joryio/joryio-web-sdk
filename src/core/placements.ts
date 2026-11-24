@@ -474,8 +474,6 @@ export class PlacementManager {
   private spotViewable = new Set<string>();
   /** `key + event` re-checked in this page view. */
   private rechecked = new Set<string>();
-  /** The event the next batch re-checks for (only a re-check request carries it). */
-  private recheckEvent: RecheckEvent | null = null;
 
   constructor(
     private apiEndpoint: string,
@@ -771,12 +769,19 @@ export class PlacementManager {
   /**
    * Ask the server again for `keys` now, past the client refresh limit (the
    * show-when re-check), carrying the event that caused it (`recheckEvent`).
+   * A request of its own per (keys, event), like iOS and Android: never
+   * batched with another key's fetch or re-check, never joined to a normal
+   * fetch, so one event never rides on another key's re-check and two
+   * re-checks are never folded into one.
    */
   recheck(keys: string[], event?: RecheckEvent): Promise<void> {
-    const go = (): Promise<void> => {
-      keys.forEach((key) => this.lastNetworkAt.delete(this.rateKey(key)));
-      if (event) this.recheckEvent = event;
-      return this.fetchKeys(keys, false);
+    const go = async (): Promise<void> => {
+      if (this.destroyed) return;
+      const chunks: string[][] = [];
+      for (let i = 0; i < keys.length; i += PLACEMENT_MAX_KEYS_PER_REQUEST) {
+        chunks.push(keys.slice(i, i + PLACEMENT_MAX_KEYS_PER_REQUEST));
+      }
+      await Promise.all(chunks.map((chunk) => this.request(chunk, event ?? null)));
     };
     // A request already on its way may predate the event: ask again once it is back.
     const inflight = keys.map((key) => this.inflight.get(key)).filter(Boolean);
@@ -860,14 +865,12 @@ export class PlacementManager {
     this.batchKeys.clear();
     const waiters = this.batchWaiters;
     this.batchWaiters = [];
-    const recheckEvent = this.recheckEvent;
-    this.recheckEvent = null;
     const chunks: string[][] = [];
     for (let i = 0; i < keys.length; i += PLACEMENT_MAX_KEYS_PER_REQUEST) {
       chunks.push(keys.slice(i, i + PLACEMENT_MAX_KEYS_PER_REQUEST));
     }
     try {
-      await Promise.all(chunks.map((chunk) => this.request(chunk, recheckEvent)));
+      await Promise.all(chunks.map((chunk) => this.request(chunk)));
     } finally {
       keys.forEach((key) => this.inflight.delete(key));
       waiters.forEach((w) => w.resolve());
@@ -900,8 +903,9 @@ export class PlacementManager {
       placements: keys,
       shown,
       context: this.page ? { ...this.page.current(), screen: null } : pageContext(),
-      ...(recheckEvent ? { recheckEvent } : {}),
     };
+    // Only a re-check carries the event that caused it.
+    if (recheckEvent) body.recheckEvent = recheckEvent;
 
     const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
     const timeout = setTimeout(() => controller?.abort(), this.runtime.requestTimeoutMs ?? 10000);

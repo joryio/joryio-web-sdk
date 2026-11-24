@@ -641,6 +641,9 @@ export class JoryioSDK {
         canSend: () => this.isInitialized && !this.disabled && !this.network.isSuspended() && this.canSend(),
         requestTimeoutMs: this.config.requestTimeout,
         noteStatus: (status, data) => this.network.noteSuspended(status, data),
+        // The attributes set on this device in this session (setAttributes,
+        // push_permission), as iOS and Android send them: rules on them match.
+        attributes: () => this.identity.getAttributes(),
       },
       this.network,
     );

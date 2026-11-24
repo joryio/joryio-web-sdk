@@ -48,6 +48,15 @@ export interface FallbackWords {
 }
 
 const PILL_ATTR = 'data-liquid';
+
+/** Take `n` out of the DOM; never throws into the host page (a removal re-entered from a blur handler can). */
+function detach(n: Node): void {
+  try {
+    if (n.parentNode) n.parentNode.removeChild(n);
+  } catch {
+    /* already gone */
+  }
+}
 const isPill = (n: Node | null | undefined): n is HTMLElement => !!n && n.nodeType === 1 && (n as Element).hasAttribute(PILL_ATTR);
 
 /** A box's content as Liquid: text as is, a pill as its Liquid, a browser-inserted `<br>` as nothing. */
@@ -138,10 +147,17 @@ export function liquidField(opts: {
     );
   };
 
+  /**
+   * Removing a focused node fires blur/focusout synchronously (Chromium):
+   * `pop` is cleared BEFORE the removal, so the popover's own focusout sees it
+   * gone and never removes it a second time mid-removal, which throws
+   * ("Failed to execute 'remove' on 'Element'") into the host page.
+   */
   const closePop = (): boolean => {
-    if (!pop) return false;
-    pop.remove();
+    const p = pop;
+    if (!p) return false;
     pop = null;
+    detach(p);
     return true;
   };
   /** A pill's own fallback: the popover under the field, writing that pill's `| default:` as it is typed. */
@@ -199,7 +215,10 @@ export function liquidField(opts: {
     value = v;
     saved = null;
     pop = null;
-    el.textContent = '';
+    // Cleared first: the old box's blur, fired by its removal below, sees it is no longer current.
+    box = null;
+    Array.from(el.childNodes).forEach(detach);
+    if (el.firstChild) el.textContent = '';
     const parts = liquidParts(v);
     if (!parts) {
       const area = h('textarea', { rows: '3', dir: 'auto', 'data-j': 'text', 'aria-label': opts.label });
@@ -208,7 +227,7 @@ export function liquidField(opts: {
         value = area.value;
         opts.onChange(value);
       });
-      area.addEventListener('blur', () => liquidParts(value) && set(value));
+      area.addEventListener('blur', () => box === area && liquidParts(value) && set(value));
       box = area;
       el.append(area, h('div', { class: 'help2', 'data-j': 'raw-note' }, opts.rawNote));
       return;
@@ -272,7 +291,7 @@ export function liquidField(opts: {
       if (/\{[{%]/.test(text)) set(value);
     });
     // Liquid typed by hand becomes pills (or the raw box) once the field is left.
-    ce.addEventListener('blur', () => Array.from(ce.childNodes).some((n) => n.nodeType === 3 && /\{[{%]/.test((n as Text).data)) && set(value));
+    ce.addEventListener('blur', () => box === ce && Array.from(ce.childNodes).some((n) => n.nodeType === 3 && /\{[{%]/.test((n as Text).data)) && set(value));
     box = ce;
     el.appendChild(ce);
   };

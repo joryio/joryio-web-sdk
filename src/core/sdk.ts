@@ -397,10 +397,13 @@ export class JoryioSDK {
     if (linkToken && !this.disabled) this.pendingLinkToken = linkToken;
 
     // Initialize UTM tracking (before session to check for campaign changes)
+    // `captureUTM: false` keeps nothing from the URL in storage - no UTM
+    // values, referrer or landing page (1.4.0-beta.15).
     this.utm = new UTMManager(
       this.storage,
       this.logger,
       this.config.resetSessionOnNewCampaign,
+      this.config.captureUTM,
     );
 
     // Check if we should reset session due to new campaign
@@ -1859,7 +1862,12 @@ export class JoryioSDK {
 
       // Merge event properties with UTM parameters if enabled
       if (this.config.captureUTM) {
+        // An event's own landing_page wins over the stored one: Session Start
+        // sends the full landing address (the server builds the first Page
+        // Viewed from it), while storage keeps only origin + path.
+        const own = eventProperties.landing_page;
         Object.assign(eventProperties, this.utm.getUTMProperties());
+        if (own !== undefined) eventProperties.landing_page = own;
       }
 
       // Always include device_id in event properties for tracking

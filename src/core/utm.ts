@@ -29,10 +29,34 @@ export interface UTMData {
   lastTouch: UTMParameters | null;    // Most recent UTM (last touch attribution)
 }
 
+/**
+ * A URL as the SDK keeps it in browser storage: origin + path, without its
+ * query string or fragment (1.4.0-beta.15). A landing URL's query can carry
+ * anything the site or a link put there - a login or reset token, an email
+ * address, an order number - and localStorage keeps it for good (first touch
+ * is lifetime). The campaign values the query is kept for are stored apart,
+ * as the parsed utm_* fields. Unparseable input is cut at the first `?` / `#`.
+ */
+export function urlWithoutQuery(href: string | null | undefined): string | undefined {
+  if (!href) return undefined;
+  try {
+    const u = new URL(href);
+    return `${u.origin}${u.pathname}`;
+  } catch {
+    return href.split(/[?#]/)[0] || undefined;
+  }
+}
+
 export class UTMManager {
   private storage: StorageManager;
   private logger: Logger;
   private resetSessionOnNewCampaign: boolean;
+  /**
+   * `captureUTM`. Off: nothing is read from the URL or kept in storage - no
+   * UTM values, referrer or landing page - and whatever an earlier version
+   * (or an earlier `captureUTM: true`) stored is removed.
+   */
+  private enabled: boolean;
   // Whether the current URL's UTM differs from the STORED session UTM. Computed
   // BEFORE captureUTMParameters() overwrites SESSION_UTM_KEY, otherwise the
   // comparison always sees the just-written value and returns false.
@@ -42,10 +66,18 @@ export class UTMManager {
     storage: StorageManager,
     logger: Logger,
     resetSessionOnNewCampaign: boolean = false,
+    enabled: boolean = true,
   ) {
     this.storage = storage;
     this.logger = logger;
     this.resetSessionOnNewCampaign = resetSessionOnNewCampaign;
+    this.enabled = enabled;
+
+    if (!this.enabled) {
+      this.clearAllUTM();
+      return;
+    }
+    this.stripStoredQueries();
 
     // Compare the incoming URL against the previously stored session UTM BEFORE
     // capturing (which overwrites it), so hasNewCampaign() reflects the real
@@ -62,7 +94,7 @@ export class UTMManager {
    * Capture UTM parameters from current URL
    */
   private captureUTMParameters(): void {
-    if (typeof window === 'undefined') {
+    if (!this.enabled || typeof window === 'undefined') {
       return;
     }
 
@@ -81,13 +113,16 @@ export class UTMManager {
       }
     }
 
-    // Capture referrer (if present)
-    if (document.referrer) {
-      utm.referrer = document.referrer;
+    // Capture referrer (if present) - origin + path, like the landing page.
+    const referrer = typeof document !== 'undefined' ? urlWithoutQuery(document.referrer) : undefined;
+    if (referrer) {
+      utm.referrer = referrer;
     }
 
-    // Capture landing page
-    utm.landing_page = window.location.href;
+    // Capture landing page - origin + path only, never the query string or
+    // fragment (see urlWithoutQuery). The page view / Session Start events
+    // still send the page's own url and search; this is only what is KEPT.
+    utm.landing_page = urlWithoutQuery(window.location.href);
     utm.captured_at = Date.now();
 
     // If no UTM parameters found, check if we should still track referrer
@@ -120,6 +155,23 @@ export class UTMManager {
     // Always update last touch (most recent attribution)
     this.storage.set(LAST_TOUCH_KEY, utm);
     this.logger.debug('Updated last touch UTM:', utm);
+  }
+
+  /**
+   * Rewrite records stored by 1.4.0-beta.14 and older, which kept the full
+   * landing URL (and referrer) with its query string, to origin + path.
+   */
+  private stripStoredQueries(): void {
+    for (const key of [SESSION_UTM_KEY, FIRST_TOUCH_KEY, LAST_TOUCH_KEY]) {
+      const u = this.storage.get<UTMParameters>(key);
+      if (u && typeof u === 'object') {
+        this.storage.set(key, { ...u, landing_page: urlWithoutQuery(u.landing_page), referrer: urlWithoutQuery(u.referrer) });
+      }
+    }
+    for (const key of [SESSION_LANDING_PAGE_KEY, SESSION_REFERRER_KEY]) {
+      const v = this.storage.get<string>(key);
+      if (v) this.storage.set(key, urlWithoutQuery(v));
+    }
   }
 
   /**
@@ -184,7 +236,7 @@ export class UTMManager {
    * MUST be called before captureUTMParameters() overwrites SESSION_UTM_KEY.
    */
   private detectNewCampaign(): boolean {
-    if (typeof window === 'undefined') {
+    if (!this.enabled || typeof window === 'undefined') {
       return false;
     }
 
@@ -219,6 +271,7 @@ export class UTMManager {
    * capturing overwrites it, so a subsequent hasNewCampaign() is accurate.
    */
   updateUTM(): void {
+    if (!this.enabled) return;
     if (this.resetSessionOnNewCampaign) {
       this.newCampaignDetected = this.detectNewCampaign();
     }

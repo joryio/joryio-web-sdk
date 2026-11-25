@@ -1,6 +1,7 @@
 import {
   CardManager,
   CARD_MIN_REFRESH_SECONDS,
+  CARD_RETRY_AFTER_FAILURE_SECONDS,
   CARD_FEED_TTL_SECONDS,
   CARD_SDK_CAPABILITY,
   cardsDeviceStorageKey,
@@ -262,6 +263,35 @@ describe('cards: fetching', () => {
     expect(feeds()).toHaveLength(2);
     expect(feed.cards.map((c) => c.id)).toEqual(['a']);
     expect(feed.unreadCount).toBe(1);
+  });
+
+  // 1.4.0-beta.11 test (Android): a failed feed request blocked the next one for the whole 30 s window.
+  it('a request with no answer (or a 5xx) holds the next one back only CARD_RETRY_AFTER_FAILURE_SECONDS', async () => {
+    expect(CARD_RETRY_AFTER_FAILURE_SECONDS).toBe(3);
+    let mode: 'down' | '503' | 'ok' = 'down';
+    const m = make({
+      responder: () => {
+        if (mode === 'down') throw new TypeError('Failed to fetch');
+        if (mode === '503') return { status: 503 };
+        return feedAnswer([card('a')]);
+      },
+    });
+    expect((await m.getCards()).cards).toEqual([]);
+    mode = 'ok';
+    await flush(1000);
+    await m.getCards();
+    expect(feeds()).toHaveLength(1);
+    await flush(CARD_RETRY_AFTER_FAILURE_SECONDS * 1000);
+    expect((await m.getCards()).cards.map((c) => c.id)).toEqual(['a']);
+    expect(feeds()).toHaveLength(2);
+    mode = '503';
+    await flush(CARD_FEED_TTL_SECONDS * 1000);
+    await m.getCards();
+    expect(feeds()).toHaveLength(3);
+    mode = 'ok';
+    await flush(CARD_RETRY_AFTER_FAILURE_SECONDS * 1000 + 10);
+    await m.getCards();
+    expect(feeds()).toHaveLength(4);
   });
 
   it('HTTP 429 and success: false keep the cached cards', async () => {

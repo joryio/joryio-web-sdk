@@ -2,6 +2,7 @@ import {
   PlacementManager,
   PlacementConsent,
   PLACEMENT_MIN_REFRESH_SECONDS,
+  PLACEMENT_RETRY_AFTER_FAILURE_SECONDS,
   PLACEMENT_VIEWABLE_FRACTION,
   PLACEMENT_BATCH_WINDOW_MS,
   isAppDeepLink,
@@ -234,6 +235,50 @@ describe('placements: fetching', () => {
     expect(serves()).toHaveLength(1);
     await jest.advanceTimersByTimeAsync(PLACEMENT_MIN_REFRESH_SECONDS * 1000 + 100);
     expect(serves()).toHaveLength(2);
+  });
+
+  // 1.4.0-beta.11 test (Android): a failed request stamped its keys for the whole
+  // 30 s window, so they read empty for 30 s.
+  it('a request with no answer (or a 5xx) holds its keys back only PLACEMENT_RETRY_AFTER_FAILURE_SECONDS; a 429 the whole window', async () => {
+    expect(PLACEMENT_RETRY_AFTER_FAILURE_SECONDS).toBe(3);
+    let mode: 'down' | '503' | '429' | 'ok' = 'down';
+    const m = make({
+      responder: () => {
+        if (mode === 'down') throw new TypeError('Failed to fetch');
+        if (mode === '503' || mode === '429') return { status: Number(mode) };
+        return answer({ home_hero: hero() });
+      },
+    });
+    const ask = async () => {
+      const p = m.getPlacements(['home_hero']);
+      await flush();
+      return p;
+    };
+    expect((await ask()).home_hero.items).toEqual([]);
+    mode = 'ok';
+    await jest.advanceTimersByTimeAsync(1000);
+    await ask();
+    expect(serves()).toHaveLength(1);
+    await jest.advanceTimersByTimeAsync(PLACEMENT_RETRY_AFTER_FAILURE_SECONDS * 1000);
+    expect((await ask()).home_hero.items.map((i) => i.id)).toEqual(['camp-1']);
+    expect(serves()).toHaveLength(2);
+    // A 5xx is a failure too.
+    mode = '503';
+    await jest.advanceTimersByTimeAsync(301_000);
+    await ask();
+    expect(serves()).toHaveLength(3);
+    mode = 'ok';
+    await jest.advanceTimersByTimeAsync(PLACEMENT_RETRY_AFTER_FAILURE_SECONDS * 1000 + 10);
+    await ask();
+    expect(serves()).toHaveLength(4);
+    // A 429 keeps the whole window.
+    mode = '429';
+    await jest.advanceTimersByTimeAsync(301_000);
+    await ask();
+    expect(serves()).toHaveLength(5);
+    await jest.advanceTimersByTimeAsync(PLACEMENT_RETRY_AFTER_FAILURE_SECONDS * 1000 + 10);
+    await ask();
+    expect(serves()).toHaveLength(5);
   });
 
   it('keeps the cached answer when the server says 429', async () => {

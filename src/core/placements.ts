@@ -71,6 +71,12 @@ import {
 export const PLACEMENT_VIEWABLE_FRACTION = 0.5;
 /** A placement key is fetched from the network at most once per this many seconds. Same on every Joryio SDK. */
 export const PLACEMENT_MIN_REFRESH_SECONDS = 30;
+/**
+ * A request that got no answer (no connection, a 5xx) holds its keys back this
+ * many seconds instead of PLACEMENT_MIN_REFRESH_SECONDS: one failed request
+ * must not leave a placement empty for 30 s. A 429 keeps the full window. Same on every Joryio SDK.
+ */
+export const PLACEMENT_RETRY_AFTER_FAILURE_SECONDS = 3;
 /** Keys asked for within this window go in one request. */
 export const PLACEMENT_BATCH_WINDOW_MS = 50;
 /** The serve endpoint takes 1-10 keys per request. */
@@ -883,7 +889,16 @@ export class PlacementManager {
     const generation = this.generation;
     const personal = consent === 'granted';
     const sentAt = nowMs();
-    keys.forEach((key) => this.lastNetworkAt.set(this.rateKey(key), sentAt));
+    const rateKeys = keys.map((key) => this.rateKey(key));
+    rateKeys.forEach((k) => this.lastNetworkAt.set(k, sentAt));
+    // No answer or a server error: the keys may go again after
+    // PLACEMENT_RETRY_AFTER_FAILURE_SECONDS, not the whole window (1.4.0-beta.12).
+    const failed = () => {
+      const retryAt = sentAt - (PLACEMENT_MIN_REFRESH_SECONDS - PLACEMENT_RETRY_AFTER_FAILURE_SECONDS) * 1000;
+      rateKeys.forEach((k) => {
+        if (this.lastNetworkAt.get(k) === sentAt) this.lastNetworkAt.set(k, retryAt);
+      });
+    };
     const askedFor = this.currentUrl();
 
     const shown: Record<string, string[]> = {};
@@ -928,6 +943,7 @@ export class PlacementManager {
         // 429 (the per-device limit) and every other failure: keep the cache.
         this.runtime.noteStatus?.(response.status, null);
         this.logger.debug(`Placements request answered ${response.status}; keeping the cached placements`);
+        if (response.status >= 500) failed();
         return;
       }
       const data: PlacementsResponse = await response.json();
@@ -957,6 +973,7 @@ export class PlacementManager {
     } catch (error) {
       const timedOut = (error as any)?.name === 'AbortError';
       this.logger.debug(timedOut ? 'Placements request timed out' : 'Placements request failed', error);
+      failed();
     } finally {
       clearTimeout(timeout);
     }

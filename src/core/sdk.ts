@@ -1088,6 +1088,7 @@ export class JoryioSDK {
         if (anonymousId === this.identity.getAnonymousId() && userId === this.identity.getUserId()) return;
         this.logger.info('Another tab changed the visitor identity; following it');
         const loggedOut = anonymousId !== this.identity.getAnonymousId();
+        const previousUserId = this.identity.getUserId();
         // The same bookkeeping reset() / identify() does here (rule 62):
         // in-app first (dismissed as the outgoing user, with their token)...
         if (this.config.inApp.enabled) this.inapp.clearAll();
@@ -1102,6 +1103,8 @@ export class JoryioSDK {
         // Another person: the anonymous visitor's card state goes too.
         this.cards.invalidate(true);
         this.pageEdits?.invalidate();
+        // The other tab cleared the stored exposure marks already (reset / a different person).
+        if (loggedOut || (!!previousUserId && previousUserId !== userId)) this.flags.clearExposureMarks(false);
         this.flags.onIdentityChanged();
         // Whoever was kept for withdrawals here belongs to the old identity.
         this.withdrawalUserId = null;
@@ -2030,6 +2033,8 @@ export class JoryioSDK {
       this.pendingRechecks = []; // never run a re-check queued for another person or consent
       this.cards.invalidate(true);
       this.pageEdits?.invalidate();
+      // Another person (as for attributes, beta.11): the session's exposure marks go.
+      if (switching) this.flags.clearExposureMarks();
       this.flags.onIdentityChanged();
     }
 
@@ -2592,6 +2597,7 @@ export class JoryioSDK {
     // New anonymous id, no user id.
     this.pinAnonymousWrites();
     this.identity.reset(anonymousId);
+    this.flags.clearExposureMarks();
     this.flags.onIdentityChanged();
     this.network.setCurrentUserId(this.identity.getUserId());
     this.placements.invalidate();
@@ -2705,6 +2711,7 @@ export class JoryioSDK {
     this.forgetDeferredIdentify();
     this.pinAnonymousWrites();
     this.identity.reset();
+    this.flags.clearExposureMarks();
     this.flags.onIdentityChanged();
     this.network.setCurrentUserId(null);
     this.placements.invalidate();

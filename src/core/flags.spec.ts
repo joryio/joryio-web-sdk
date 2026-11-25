@@ -1,4 +1,4 @@
-import { FlagsManager, FLAG_EXPOSURE_FLUSH_MS, flagsStorageKey } from './flags';
+import { FlagsManager, FLAG_EXPOSURE_FLUSH_MS, FLAG_EXPOSURE_MARKS_MAX, flagExposuresStorageKey, flagsStorageKey } from './flags';
 import { installFetch, installLocalStorage, uninstallLocalStorage, settle, RecordedRequest } from './test-harness';
 
 /**
@@ -115,6 +115,8 @@ describe('FlagsManager (web)', () => {
       { key: 'limit', variant: 'five' },
     ]);
     expect(ex[0].body).toMatchObject({ anonymousId: 'anon-1', sessionId: 'sess-1' });
+    // 1.4.0-beta.12: the batch's idempotencyKey (a lowercase UUID, as on iOS and Android).
+    expect(ex[0].body.idempotencyKey).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
   });
 
   it('without consent nothing is sent and the defaults are returned', async () => {
@@ -222,5 +224,101 @@ describe('FlagsManager (web)', () => {
     installFetch(() => ({ status: 503, body: {} }));
     await m.refreshFlags();
     expect(m.getBoolFlag('new_checkout', false)).toBe(true);
+  });
+});
+
+/**
+ * BACKLOG D479: the "already sent" exposure marks of the current session are
+ * kept in localStorage, so a page reload in the same session sends no
+ * duplicate; another session sends again; reset / another person clears them.
+ */
+describe('FlagsManager (web): exposure marks survive a reload within the session', () => {
+  let calls: RecordedRequest[];
+  let sessionId = 'sess-1';
+  const live: FlagsManager[] = [];
+  const page = (userId: string | null = null) => {
+    const identity = { getUserId: () => userId, getAnonymousId: () => 'anon-1' } as any;
+    const session = { getSessionId: () => sessionId } as any;
+    const logger = { debug: jest.fn(), error: jest.fn(), warn: jest.fn(), info: jest.fn() } as any;
+    const m = new FlagsManager('https://api.test', 'sdk-key', identity, session, logger, { canSend: () => true });
+    live.push(m);
+    return m;
+  };
+  const exposuresSent = () => calls.filter((c) => c.path === '/v1/flags/exposures').flatMap((c) => c.body.exposures);
+  const readAndFlush = async (m: FlagsManager) => {
+    await m.refreshFlags();
+    m.getBoolFlag('new_checkout', false);
+    await settle(FLAG_EXPOSURE_FLUSH_MS + 50);
+  };
+
+  beforeEach(() => {
+    jest.useRealTimers();
+    sessionId = 'sess-1';
+    installLocalStorage();
+    calls = installFetch((req) =>
+      req.path === '/v1/flags/evaluate' ? { status: 200, body: ANSWER } : { status: 200, body: { success: true, accepted: 1, dropped: 0 } },
+    );
+  });
+  afterEach(() => {
+    live.splice(0).forEach((m) => m.destroy());
+    uninstallLocalStorage();
+  });
+
+  it('a reload in the same session sends no duplicate exposure', async () => {
+    await readAndFlush(page());
+    expect(exposuresSent()).toEqual([{ key: 'new_checkout', variant: 'on' }]);
+    // The page reloads: a new FlagsManager over the same localStorage, same session.
+    await readAndFlush(page());
+    expect(exposuresSent()).toHaveLength(1);
+    expect(JSON.parse(localStorage.getItem(flagExposuresStorageKey('sdk-key'))!)).toEqual({
+      sessionId: 'sess-1',
+      marks: ['sess-1||anon-1|new_checkout|on'],
+    });
+  });
+
+  it('a new session sends again, and keeps only the new session\'s marks', async () => {
+    await readAndFlush(page());
+    sessionId = 'sess-2';
+    await readAndFlush(page());
+    expect(exposuresSent()).toHaveLength(2);
+    expect(JSON.parse(localStorage.getItem(flagExposuresStorageKey('sdk-key'))!).marks).toEqual(['sess-2||anon-1|new_checkout|on']);
+  });
+
+  it('clearExposureMarks (reset, identify of a different person) clears the marks: the next read is sent again', async () => {
+    const m = page('customer-1');
+    await readAndFlush(m);
+    m.clearExposureMarks();
+    expect(localStorage.getItem(flagExposuresStorageKey('sdk-key'))).toBeNull();
+    await readAndFlush(page('customer-1'));
+    expect(exposuresSent()).toHaveLength(2);
+  });
+
+  it(`keeps at most ${FLAG_EXPOSURE_MARKS_MAX} marks, the oldest dropped first`, async () => {
+    const marks = Array.from({ length: FLAG_EXPOSURE_MARKS_MAX }, (_, i) => `sess-1||anon-1|flag_${i}|on`);
+    localStorage.setItem(flagExposuresStorageKey('sdk-key'), JSON.stringify({ sessionId: 'sess-1', marks }));
+    await readAndFlush(page());
+    const kept = JSON.parse(localStorage.getItem(flagExposuresStorageKey('sdk-key'))!).marks;
+    expect(kept).toHaveLength(FLAG_EXPOSURE_MARKS_MAX);
+    expect(kept[0]).toBe('sess-1||anon-1|flag_1|on');
+    expect(kept[kept.length - 1]).toBe('sess-1||anon-1|new_checkout|on');
+  });
+
+  it('a mark is stored when its batch is sent: a page closed before the flush sends it after the reload', async () => {
+    const m = page();
+    await m.refreshFlags();
+    m.getBoolFlag('new_checkout', false);
+    expect(localStorage.getItem(flagExposuresStorageKey('sdk-key'))).toBeNull();
+    m.destroy(); // closed within the flush delay: nothing sent
+    await readAndFlush(page());
+    expect(exposuresSent()).toEqual([{ key: 'new_checkout', variant: 'on' }]);
+  });
+
+  it('unreadable or blocked storage falls back to memory (still once per page)', async () => {
+    localStorage.setItem(flagExposuresStorageKey('sdk-key'), '{not json');
+    const m = page();
+    await readAndFlush(m);
+    m.getBoolFlag('new_checkout', false);
+    await settle(FLAG_EXPOSURE_FLUSH_MS + 50);
+    expect(exposuresSent()).toHaveLength(1);
   });
 });

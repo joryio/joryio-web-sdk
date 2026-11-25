@@ -17,7 +17,10 @@
  * - An exposure (`flag.exposure`) is logged the first time a value is read in
  *   a session: once per flag and variant per session, unless the answer said
  *   `logExposure: false` (server-side sampling). The server re-evaluates every
- *   exposure, so only real assignments count.
+ *   exposure, so only real assignments count. The "already sent" marks of the
+ *   current session are kept in localStorage (BACKLOG D479), so a page reload
+ *   or another tab in the same session does not send them again; the server
+ *   also counts an exposure once per person, flag, variant and session.
  * - Without tracking consent nothing is sent: no request names the visitor,
  *   no exposure is logged, and the getters return the in-code default.
  *
@@ -26,6 +29,7 @@
 import { JoryioSubscription, joryioSubscription } from './subscription';
 import { Logger } from '../utils/logger';
 import { bucketHash } from '../utils/bucket-hash';
+import { generateUUID } from '../utils/uuid';
 import { sdkIdentityHeaders } from './config';
 import { IdentityManager } from './identity';
 import { SessionManager } from './session';
@@ -34,6 +38,8 @@ import { SessionManager } from './session';
 export const FLAGS_MIN_REFRESH_SECONDS = 60;
 /** Exposures are sent in one request this long after the first read. */
 export const FLAG_EXPOSURE_FLUSH_MS = 1000;
+/** "Already sent" exposure marks kept for the current session, oldest dropped first. The same on all five SDKs. */
+export const FLAG_EXPOSURE_MARKS_MAX = 500;
 /** The silent-push value that refreshes flags on the native SDKs (not applicable on the web). */
 export const FLAG_SYNC_PUSH_VALUE = 'flags';
 
@@ -87,6 +93,8 @@ interface Stored {
  */
 const LEGACY_STORAGE_KEY = 'jry_flags';
 export const flagsStorageKey = (sdkKey: string): string => `jry_flags_${bucketHash(sdkKey).toString(36)}`;
+/** The current session's exposure marks, per workspace like the answer: `{ sessionId, marks }`. */
+export const flagExposuresStorageKey = (sdkKey: string): string => `jry_flag_exposures_${bucketHash(sdkKey).toString(36)}`;
 const nowMs = () => Date.now();
 
 export class FlagsManager {
@@ -97,15 +105,28 @@ export class FlagsManager {
   private inflight: Promise<void> | null = null;
   private inflightGeneration = 0;
   private listeners = new Set<FlagsUpdatedCallback>();
-  /** `<sessionId>|<person>|<flag>|<variant>` already reported this session. */
+  /**
+   * `<sessionId>|<person>|<flag>|<variant>` already reported this session, in
+   * the order they were read. Stored in localStorage (flagExposuresStorageKey)
+   * when a batch is sent, so a reload in the same session starts from what was
+   * already sent.
+   */
   private exposed = new Set<string>();
+  /** The session `exposed` belongs to; another session starts empty. */
+  private exposedSession: string | null = null;
   /**
    * Exposures waiting to be sent, each batch with the identity it was read
    * under (who, session, attributes, generation) - captured when the first
    * exposure of the batch was queued. A batch is always sent as the person who
    * read the values, never as whoever is identified when the timer fires.
    */
-  private pending: { body: Record<string, unknown>; generation: number; exposures: Array<{ key: string; variant: string }> } | null = null;
+  private pending: {
+    body: Record<string, unknown>;
+    generation: number;
+    exposures: Array<{ key: string; variant: string }>;
+    /** One UUID per batch (1.4.0-beta.12): a copy of the request sent again is recorded once by the server. */
+    idempotencyKey: string;
+  } | null = null;
   private flushTimer: ReturnType<typeof setTimeout> | null = null;
   /** The app reads flags on this device (a stored answer, or a call this page). */
   private used = false;
@@ -226,16 +247,61 @@ export class FlagsManager {
     if (!f.logExposure) return;
     // The person is part of the mark: after an account switch in the same
     // session the next person's first read is their own exposure.
-    const mark = `${this.session.getSessionId()}|${this.subjectKey()}|${key}|${f.variant}`;
+    const sessionId = this.session.getSessionId();
+    const mark = `${sessionId}|${this.subjectKey()}|${key}|${f.variant}`;
+    if (this.exposedSession === sessionId && this.exposed.has(mark)) return;
+    // A miss re-reads the stored marks (once per flag and variant per session,
+    // not per read): a reload, or another tab of this session, may have sent it.
+    this.loadExposures(sessionId);
     if (this.exposed.has(mark)) return;
     this.exposed.add(mark);
+    while (this.exposed.size > FLAG_EXPOSURE_MARKS_MAX) this.exposed.delete(this.exposed.values().next().value as string);
     if (!this.pending || this.pending.generation !== this.generation) {
       // A batch from before an identity change is sent first, as its own person.
       if (this.pending) this.flush();
-      this.pending = { body: this.requestBody(), generation: this.generation, exposures: [] };
+      this.pending = { body: this.requestBody(), generation: this.generation, exposures: [], idempotencyKey: generateUUID() };
     }
     this.pending.exposures.push({ key, variant: f.variant });
     if (!this.flushTimer) this.flushTimer = setTimeout(() => this.flush(), FLAG_EXPOSURE_FLUSH_MS);
+  }
+
+  /**
+   * reset(), identify() of a different person and wipeData(): the marks of
+   * the session go (memory and, unless another tab already did it, storage).
+   */
+  clearExposureMarks(storage = true): void {
+    this.exposed = new Set();
+    this.exposedSession = null;
+    if (!storage) return;
+    try {
+      if (typeof localStorage !== 'undefined') localStorage.removeItem(flagExposuresStorageKey(this.sdkKey));
+    } catch {
+      /* blocked storage: memory only */
+    }
+  }
+
+  /** The stored marks of THIS session (another session's are ignored and replaced on the next save). */
+  private loadExposures(sessionId: string): void {
+    let marks: string[] = [];
+    try {
+      const raw = typeof localStorage !== 'undefined' ? localStorage.getItem(flagExposuresStorageKey(this.sdkKey)) : null;
+      const s = raw ? JSON.parse(raw) : null;
+      if (s && s.sessionId === sessionId && Array.isArray(s.marks)) marks = s.marks.filter((m: unknown) => typeof m === 'string');
+    } catch {
+      /* unreadable storage: what this page has */
+    }
+    const kept = this.exposedSession === sessionId ? this.exposed : new Set<string>();
+    this.exposed = new Set([...marks.slice(-FLAG_EXPOSURE_MARKS_MAX), ...kept]);
+    this.exposedSession = sessionId;
+  }
+
+  private saveExposures(): void {
+    try {
+      if (typeof localStorage === 'undefined') return;
+      localStorage.setItem(flagExposuresStorageKey(this.sdkKey), JSON.stringify({ sessionId: this.exposedSession, marks: Array.from(this.exposed) }));
+    } catch {
+      /* storage full or blocked: memory only */
+    }
   }
 
   /** Send the queued exposures (one request, the same identity as the evaluation). */
@@ -246,7 +312,10 @@ export class FlagsManager {
     this.pending = null;
     // Consent withdrawn since the reads: nothing is sent.
     if (!batch || !batch.exposures.length || !this.runtime.canSend()) return;
-    const body = { ...batch.body, exposures: batch.exposures.slice(0, 100) };
+    const body = { ...batch.body, exposures: batch.exposures.slice(0, 100), idempotencyKey: batch.idempotencyKey };
+    // Stored when SENT, not when read: a page closed before the batch went
+    // sends that exposure again after the reload instead of losing it.
+    this.saveExposures();
     this.post('/v1/flags/exposures', body, true).catch((error) => this.logger.debug('Flag exposures failed', error));
   }
 

@@ -73,7 +73,7 @@ export { IN_APP_DISPLAY_DWELL_MS } from './core/inapp';
 
 // Placements: spots inside the page filled per visitor (the same names and
 // values on every Joryio SDK).
-export { PLACEMENT_VIEWABLE_FRACTION, PLACEMENT_MIN_REFRESH_SECONDS } from './core/placements';
+export { PLACEMENT_VIEWABLE_FRACTION, PLACEMENT_MIN_REFRESH_SECONDS, PLACEMENT_RETRY_AFTER_FAILURE_SECONDS } from './core/placements';
 export { PLACEMENT_PRODUCT_ELEMENT_PREFIX, PLACEMENT_PRODUCT_CARD_WIDTH, placementProductElementId } from './core/placements';
 export type {
   Placement,
@@ -94,7 +94,7 @@ export type { ShowWhen, ShowWhenKind } from './core/show-when';
 export type { JoryioLink, JoryioLinkSource, JoryioLinkHandler } from './core/links';
 
 // Content cards: the person's feed (the same names and values on every Joryio SDK).
-export { CARD_MIN_REFRESH_SECONDS, CARD_FEED_TTL_SECONDS } from './core/cards';
+export { CARD_MIN_REFRESH_SECONDS, CARD_RETRY_AFTER_FAILURE_SECONDS, CARD_FEED_TTL_SECONDS } from './core/cards';
 export type {
   Card,
   CardFeed,

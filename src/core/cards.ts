@@ -48,6 +48,8 @@ import { loadSdkScript, sdkHostFileUrls } from './sdk-host-files';
 
 /** The feed goes to the network at most once per this many seconds; extra calls coalesce. Same name and value on every Joryio SDK. */
 export const CARD_MIN_REFRESH_SECONDS = 30;
+/** A feed request that got no answer (no connection, a 5xx) holds the next one back this many seconds instead. A 429 keeps the full window. Same on every Joryio SDK. */
+export const CARD_RETRY_AFTER_FAILURE_SECONDS = 3;
 /** How long the feed is served from the cache before it is asked for again (the answer's `ttlSeconds` wins). Same on every Joryio SDK. */
 export const CARD_FEED_TTL_SECONDS = 300;
 /** The capability a card-aware SDK declares. */
@@ -444,7 +446,15 @@ export class CardManager {
     // feed, so nothing is asked (and nobody named).
     if (consent !== 'granted' || this.destroyed) return null;
     const generation = this.generation;
-    if (!cursor) this.lastNetworkAt = nowMs();
+    const sentAt = nowMs();
+    if (!cursor) this.lastNetworkAt = sentAt;
+    // No answer or a server error: the next refresh may go after
+    // CARD_RETRY_AFTER_FAILURE_SECONDS, not the whole window (1.4.0-beta.12).
+    const failed = () => {
+      if (!cursor && this.lastNetworkAt === sentAt) {
+        this.lastNetworkAt = sentAt - (CARD_MIN_REFRESH_SECONDS - CARD_RETRY_AFTER_FAILURE_SECONDS) * 1000;
+      }
+    };
     const userId = this.identity.getUserId();
     const anonymousId = this.identity.getAnonymousId();
     const body: Record<string, any> = {
@@ -477,6 +487,7 @@ export class CardManager {
         // 429 (the per-device limit) and every other failure: keep the cache.
         this.runtime.noteStatus?.(response.status, null);
         this.logger.debug(`Card feed request answered ${response.status}; keeping the cached feed`);
+        if (response.status >= 500) failed();
         return null;
       }
       const data = await response.json();
@@ -492,6 +503,7 @@ export class CardManager {
     } catch (error) {
       const timedOut = (error as any)?.name === 'AbortError';
       this.logger.debug(timedOut ? 'Card feed request timed out' : 'Card feed request failed', error);
+      failed();
       return null;
     } finally {
       clearTimeout(timeout);

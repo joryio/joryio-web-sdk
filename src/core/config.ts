@@ -2,7 +2,7 @@
  * SDK Configuration Types and Defaults
  */
 
-export const SDK_VERSION = '1.4.0-beta.12'; // keep in sync with package.json (sdk-version-parity.spec.ts pins it)
+export const SDK_VERSION = '1.4.0-beta.13'; // keep in sync with package.json (sdk-version-parity.spec.ts pins it)
 
 /**
  * Sent on EVERY request to the API, so the dashboard can show which SDK

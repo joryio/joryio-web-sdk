@@ -21,6 +21,14 @@
  *   current session are kept in localStorage (BACKLOG D479), so a page reload
  *   or another tab in the same session does not send them again; the server
  *   also counts an exposure once per person, flag, variant and session.
+ *   A mark is stored only once the server took its batch (any 2xx, or a 4xx
+ *   other than 408 / 429, which no retry would change). A batch that got no
+ *   answer, a 5xx, a 408 or a 429 is handed, with the SAME body and
+ *   `idempotencyKey`, to the SDK's persisted write outbox (kind `exposures`),
+ *   which retries it on its backoff, across reloads, and discards it on
+ *   wipeData(), an opt-out or a denied consent; its marks are stored when the
+ *   outbox settles it. While it waits there it counts as already exposed (its
+ *   marks are read from the outbox), so a read does not queue it twice.
  * - Without tracking consent nothing is sent: no request names the visitor,
  *   no exposure is logged, and the getters return the in-code default.
  *
@@ -31,6 +39,7 @@ import { Logger } from '../utils/logger';
 import { bucketHash } from '../utils/bucket-hash';
 import { generateUUID } from '../utils/uuid';
 import { sdkIdentityHeaders } from './config';
+import { parseRetryAfter, type NetworkResponse } from './network';
 import { IdentityManager } from './identity';
 import { SessionManager } from './session';
 
@@ -59,7 +68,64 @@ export interface FlagResult {
   valueType: FlagValueType;
   reason: FlagReason;
   version: number;
-  logExposure: boolean;
+  /** `false` = sampled out on the server; absent = log (the same on all five SDKs). */
+  logExposure?: boolean;
+}
+
+/**
+ * Whether an exposures batch is finished with after an answer of `status`
+ * (0 = no answer): a 2xx, or a 4xx other than 408 / 429 - a refusal a retry
+ * would not change, as the write outbox drops one. A network failure, a 5xx,
+ * a 408 or a 429 keeps the batch for a retry. The same rule, under the same
+ * name, on iOS and Android.
+ */
+export function exposureBatchSettled(status: number): boolean {
+  if (status >= 200 && status < 300) return true;
+  if (status === 408 || status === 429) return false;
+  return status >= 400 && status < 500;
+}
+
+/** Exposures per request (the server's limit); a larger batch goes as several. */
+const FLAG_EXPOSURES_PER_CALL_MAX = 100;
+
+/**
+ * A batch as requests of at most FLAG_EXPOSURES_PER_CALL_MAX exposures, each
+ * with its own idempotencyKey (the first keeps the batch's) and its own marks:
+ * each is settled, kept and retried on its own. The same on iOS and Android.
+ */
+function splitExposureBatch(batch: ExposureBatch): ExposureBatch[] {
+  const out: ExposureBatch[] = [];
+  for (let i = 0; i < batch.exposures.length; i += FLAG_EXPOSURES_PER_CALL_MAX) {
+    out.push({
+      ...batch,
+      exposures: batch.exposures.slice(i, i + FLAG_EXPOSURES_PER_CALL_MAX),
+      marks: batch.marks.slice(i, i + FLAG_EXPOSURES_PER_CALL_MAX),
+      idempotencyKey: i ? generateUUID() : batch.idempotencyKey,
+    });
+  }
+  return out;
+}
+
+/** One exposures request, with the identity it was read under. */
+interface ExposureBatch {
+  body: Record<string, unknown>;
+  generation: number;
+  exposures: Array<{ key: string; variant: string }>;
+  /** One UUID per batch (1.4.0-beta.12), the same on every retry: the server records the batch once. */
+  idempotencyKey: string;
+  /** The batch's exposure marks, stored once the server took it. */
+  marks: string[];
+  /** `wipes` when the batch was made: one read before wipeData() is never handed to the outbox. */
+  wipe: number;
+}
+
+/**
+ * The marks of an exposures request body: `<session>|<user>|<anonymous>|<flag>|<variant>`,
+ * from the identity the batch carries. The same on iOS and Android.
+ */
+export function exposureMarks(body: Record<string, any>): string[] {
+  const list = Array.isArray(body?.exposures) ? body.exposures : [];
+  return list.map((e: any) => `${body.sessionId}|${body.userId || ''}|${body.anonymousId}|${e?.key}|${e?.variant}`);
 }
 
 export type FlagsUpdatedCallback = (changedKeys: string[]) => void;
@@ -71,6 +137,10 @@ interface FlagsAuth {
 interface FlagsRuntime {
   /** true when the SDK may send (initialized, consent granted, not suspended). */
   canSend: () => boolean;
+  /** Hand a batch the server did not take to the persisted write outbox (same body, same key). */
+  enqueueExposures?: (body: Record<string, unknown>) => void;
+  /** The bodies of the exposure batches waiting in the write outbox. */
+  pendingExposures?: () => Array<Record<string, unknown>>;
   requestTimeoutMs?: number;
   noteStatus?: (status: number, data: unknown) => void;
   /** Attributes the app set on this device, matched by attribute rules. */
@@ -120,14 +190,10 @@ export class FlagsManager {
    * exposure of the batch was queued. A batch is always sent as the person who
    * read the values, never as whoever is identified when the timer fires.
    */
-  private pending: {
-    body: Record<string, unknown>;
-    generation: number;
-    exposures: Array<{ key: string; variant: string }>;
-    /** One UUID per batch (1.4.0-beta.12): a copy of the request sent again is recorded once by the server. */
-    idempotencyKey: string;
-  } | null = null;
+  private pending: ExposureBatch | null = null;
   private flushTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Bumped by wipe(): a batch read before it is never handed to the outbox. */
+  private wipes = 0;
   /** The app reads flags on this device (a stored answer, or a call this page). */
   private used = false;
   private onVisible = () => {
@@ -244,7 +310,8 @@ export class FlagsManager {
   }
 
   private noteExposure(key: string, f: FlagResult): void {
-    if (!f.logExposure) return;
+    // `logExposure: false` = sampled out on the server; absent = log (as on iOS and Android).
+    if (f.logExposure === false) return;
     // The person is part of the mark: after an account switch in the same
     // session the next person's first read is their own exposure.
     const sessionId = this.session.getSessionId();
@@ -259,9 +326,10 @@ export class FlagsManager {
     if (!this.pending || this.pending.generation !== this.generation) {
       // A batch from before an identity change is sent first, as its own person.
       if (this.pending) this.flush();
-      this.pending = { body: this.requestBody(), generation: this.generation, exposures: [], idempotencyKey: generateUUID() };
+      this.pending = { body: this.requestBody(), generation: this.generation, exposures: [], idempotencyKey: generateUUID(), marks: [], wipe: this.wipes };
     }
     this.pending.exposures.push({ key, variant: f.variant });
+    this.pending.marks.push(mark);
     if (!this.flushTimer) this.flushTimer = setTimeout(() => this.flush(), FLAG_EXPOSURE_FLUSH_MS);
   }
 
@@ -270,6 +338,8 @@ export class FlagsManager {
    * the session go (memory and, unless another tab already did it, storage).
    */
   clearExposureMarks(storage = true): void {
+    // Batches already made still go, as the person who read them; their
+    // marks are not stored (storeMarks keeps the current person's only).
     this.exposed = new Set();
     this.exposedSession = null;
     if (!storage) return;
@@ -282,26 +352,65 @@ export class FlagsManager {
 
   /** The stored marks of THIS session (another session's are ignored and replaced on the next save). */
   private loadExposures(sessionId: string): void {
-    let marks: string[] = [];
-    try {
-      const raw = typeof localStorage !== 'undefined' ? localStorage.getItem(flagExposuresStorageKey(this.sdkKey)) : null;
-      const s = raw ? JSON.parse(raw) : null;
-      if (s && s.sessionId === sessionId && Array.isArray(s.marks)) marks = s.marks.filter((m: unknown) => typeof m === 'string');
-    } catch {
-      /* unreadable storage: what this page has */
-    }
     const kept = this.exposedSession === sessionId ? this.exposed : new Set<string>();
-    this.exposed = new Set([...marks.slice(-FLAG_EXPOSURE_MARKS_MAX), ...kept]);
+    // Waiting in the write outbox counts as exposed: a read does not queue it twice.
+    const waiting = (this.runtime.pendingExposures?.() ?? []).flatMap(exposureMarks).filter((m) => m.startsWith(`${sessionId}|`));
+    this.exposed = new Set([...this.storedMarks(sessionId), ...waiting, ...kept]);
     this.exposedSession = sessionId;
   }
 
-  private saveExposures(): void {
+  /** The stored marks of `sessionId` (none for another session or unreadable storage). */
+  private storedMarks(sessionId: string): string[] {
     try {
-      if (typeof localStorage === 'undefined') return;
-      localStorage.setItem(flagExposuresStorageKey(this.sdkKey), JSON.stringify({ sessionId: this.exposedSession, marks: Array.from(this.exposed) }));
+      const s = JSON.parse(localStorage.getItem(flagExposuresStorageKey(this.sdkKey)) || 'null');
+      if (s && s.sessionId === sessionId && Array.isArray(s.marks)) {
+        return s.marks.filter((m: unknown) => typeof m === 'string').slice(-FLAG_EXPOSURE_MARKS_MAX);
+      }
     } catch {
-      /* storage full or blocked: memory only */
+      /* no or unreadable storage: what this page has */
     }
+    return [];
+  }
+
+  /**
+   * The server took a batch (directly or through the outbox): its marks join
+   * the stored marks of the session (re-read first - another tab may have
+   * added its own), oldest dropped first. Only the current session's and
+   * person's: a batch of the previous person (reset, another user) stores none.
+   */
+  private storeMarks(batchMarks: string[]): void {
+    const sessionId = this.session.getSessionId();
+    const mine = `${sessionId}|${this.subjectKey()}|`;
+    const marks = this.storedMarks(sessionId);
+    for (const m of batchMarks) if (m.startsWith(mine) && !marks.includes(m)) marks.push(m);
+    try {
+      localStorage.setItem(flagExposuresStorageKey(this.sdkKey), JSON.stringify({ sessionId, marks: marks.slice(-FLAG_EXPOSURE_MARKS_MAX) }));
+    } catch {
+      /* no storage, full or blocked: memory only */
+    }
+  }
+
+  /** The write outbox settled an exposures batch (taken, or refused for good): its marks are stored. */
+  exposuresSettled(body: Record<string, unknown>): void {
+    this.storeMarks(exposureMarks(body));
+  }
+
+  /** The outbox's request for an exposures batch: the same transport as the first attempt. */
+  async sendExposures(body: Record<string, unknown>): Promise<NetworkResponse> {
+    try {
+      const res = await this.request('/v1/flags/exposures', body, true);
+      return { ok: res.status >= 200 && res.status < 300, status: res.status, data: res.data, retryAfterMs: res.retryAfterMs };
+    } catch {
+      return { ok: false, status: 0 };
+    }
+  }
+
+  /** wipeData(): no exposure read before it is sent - the queued batch goes, and none on the wire is handed to the outbox. */
+  wipe(): void {
+    this.wipes++;
+    this.pending = null;
+    if (this.flushTimer) clearTimeout(this.flushTimer);
+    this.flushTimer = null;
   }
 
   /** Send the queued exposures (one request, the same identity as the evaluation). */
@@ -312,11 +421,30 @@ export class FlagsManager {
     this.pending = null;
     // Consent withdrawn since the reads: nothing is sent.
     if (!batch || !batch.exposures.length || !this.runtime.canSend()) return;
-    const body = { ...batch.body, exposures: batch.exposures.slice(0, 100), idempotencyKey: batch.idempotencyKey };
-    // Stored when SENT, not when read: a page closed before the batch went
-    // sends that exposure again after the reload instead of losing it.
-    this.saveExposures();
-    this.post('/v1/flags/exposures', body, true).catch((error) => this.logger.debug('Flag exposures failed', error));
+    // One request after the other, in reading order.
+    void (async () => {
+      for (const chunk of splitExposureBatch(batch)) await this.sendBatch(chunk);
+    })();
+  }
+
+  /**
+   * POST one batch. Its marks are stored only once the server took it
+   * (exposureBatchSettled); otherwise the write outbox gets it, with the
+   * same idempotencyKey.
+   */
+  private async sendBatch(batch: ExposureBatch): Promise<void> {
+    const body = { ...batch.body, exposures: batch.exposures, idempotencyKey: batch.idempotencyKey };
+    let status = 0;
+    try {
+      status = (await this.request('/v1/flags/exposures', body, true)).status;
+    } catch (error) {
+      this.logger.debug('Flag exposures failed', error);
+    }
+    // Taken - or refused for good (a 4xx other than 408 / 429): never sent again.
+    if (exposureBatchSettled(status)) return this.storeMarks(batch.marks);
+    // Not taken: the persisted outbox retries it, same body and key - unless
+    // the data was wiped or sending stopped (opt-out, consent) meanwhile.
+    if (batch.wipe === this.wipes && this.runtime.canSend()) this.runtime.enqueueExposures?.(body);
   }
 
   private subjectKey(): string {
@@ -352,7 +480,7 @@ export class FlagsManager {
     this.inflightGeneration = generation;
     this.inflight = (async () => {
       try {
-        const res = await this.post('/v1/flags/evaluate', { ...this.requestBody(), ...(this.etag ? { etag: this.etag } : {}) }, false);
+        const { data: res } = await this.request('/v1/flags/evaluate', { ...this.requestBody(), ...(this.etag ? { etag: this.etag } : {}) }, false);
         if (!res) return;
         if (generation !== this.generation) return; // answer for a previous visitor
         this.fetchedAt = nowMs();
@@ -378,7 +506,12 @@ export class FlagsManager {
     return this.inflight;
   }
 
-  private async post(path: string, body: Record<string, unknown>, keepalive: boolean): Promise<any> {
+  /** One POST: the HTTP status, the decoded body of a 2xx, and a Retry-After. Throws when there is no answer. */
+  private async request(
+    path: string,
+    body: Record<string, unknown>,
+    keepalive: boolean,
+  ): Promise<{ status: number; data: any; retryAfterMs?: number }> {
     const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
     const timeout = setTimeout(() => controller?.abort(), this.runtime.requestTimeoutMs ?? 10000);
     const userId = typeof body.userId === 'string' ? body.userId : null;
@@ -397,9 +530,9 @@ export class FlagsManager {
       });
       if (!response.ok) {
         this.runtime.noteStatus?.(response.status, null);
-        return null;
+        return { status: response.status, data: null, retryAfterMs: parseRetryAfter(response.headers?.get?.('retry-after')) };
       }
-      return await response.json();
+      return { status: response.status, data: await response.json() };
     } finally {
       clearTimeout(timeout);
     }

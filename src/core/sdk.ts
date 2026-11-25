@@ -26,7 +26,7 @@ import { PlacementManager, Placement, PlacementHandle, InsertPlacementOptions, P
 import { CardManager, Card, CardFeed, CardFeedHandle, CardsUpdatedCallback, GetCardsOptions, MountCardFeedOptions } from './cards';
 import { JoryioSubscription, joryioSubscription } from './subscription';
 import { LinkRouter, JoryioLinkHandler } from './links';
-import { FlagsManager, FlagsUpdatedCallback } from './flags';
+import { FlagsManager, FlagsUpdatedCallback, FLAG_EXPOSURE_MARKS_MAX, exposureMarks } from './flags';
 import { User } from './user';
 import { Logger } from '../utils/logger';
 import { getDeviceProperties } from './device';
@@ -644,6 +644,10 @@ export class JoryioSDK {
         // The attributes set on this device in this session (setAttributes,
         // push_permission), as iOS and Android send them: rules on them match.
         attributes: () => this.identity.getAttributes(),
+        // A batch the server did not take goes to the persisted outbox, as it
+        // was sent (1.4.0-beta.13); waiting there counts as already exposed.
+        enqueueExposures: (body) => this.enqueueExposures(body),
+        pendingExposures: () => this.outbox.records().filter((r) => r.kind === 'exposures').map((r) => r.payload),
       },
       this.network,
     );
@@ -1258,6 +1262,8 @@ export class JoryioSDK {
         return { url: `${endpoint}/v1/subscriptions/channel`, body: { ...record.payload, ...ids } };
       case 'group':
         return { url: `${endpoint}/v1/subscriptions/group`, body: { ...record.payload, ...ids } };
+      case 'exposures':
+        return { url: `${endpoint}/v1/flags/exposures`, body: { ...record.payload, ...ids } };
       case 'marker':
       default:
         return {
@@ -1268,6 +1274,22 @@ export class JoryioSDK {
           },
         };
     }
+  }
+
+  /**
+   * A flag exposures batch the server did not take: into the outbox as it was
+   * sent. At most FLAG_EXPOSURE_MARKS_MAX exposures wait there (the oldest
+   * batch goes first), so exposures never crowd out the profile writes.
+   */
+  private enqueueExposures(body: Record<string, unknown>): void {
+    const count = () => this.outbox.records().reduce((n, r) => n + (r.kind === 'exposures' ? exposureMarks(r.payload).length : 0), 0);
+    const incoming = exposureMarks(body).length;
+    while (count() + incoming > FLAG_EXPOSURE_MARKS_MAX) {
+      const oldest = this.outbox.find((e) => e.record.kind === 'exposures');
+      if (!oldest) break;
+      this.outbox.cancel((e) => e === oldest);
+    }
+    this.outbox.enqueue({ kind: 'exposures', payload: body as Extract<WriteRecord, { kind: 'exposures' }>['payload'] });
   }
 
   /** The opt-out marker's attribute write: the switch's value, `true` or `false`. */
@@ -1286,6 +1308,8 @@ export class JoryioSDK {
         return this.network.sendSubscriptionUpdate(endpoint, { ...record.payload, ...ids });
       case 'group':
         return this.network.sendSubscriptionGroupUpdate(endpoint, { ...record.payload, ...ids });
+      case 'exposures':
+        return this.flags.sendExposures({ ...record.payload, ...ids });
       case 'marker':
       default:
         return this.network.sendSetAttributes(
@@ -1299,6 +1323,8 @@ export class JoryioSDK {
 
   /** Bookkeeping when a write leaves the outbox. */
   private onWriteSettled(entry: OutboxEntry, outcome: 'done' | 'drop'): void {
+    // Taken, or refused for good: never sent again, so its marks are stored.
+    if (entry.record.kind === 'exposures') return this.flags.exposuresSettled(entry.record.payload);
     if (entry.record.kind !== 'marker') return;
     const value = entry.record.payload.value;
     if (outcome === 'done') {
@@ -2710,6 +2736,9 @@ export class JoryioSDK {
     this.network.clearStorefrontIdentityToken();
     this.forgetDeferredIdentify();
     this.pinAnonymousWrites();
+    // Wiped: no exposure read before it is ever sent (queued, or on the wire
+    // and then refused); the ones in the outbox go with its other writes.
+    this.flags.wipe();
     this.identity.reset();
     this.flags.clearExposureMarks();
     this.flags.onIdentityChanged();

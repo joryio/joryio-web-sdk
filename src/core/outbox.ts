@@ -132,6 +132,8 @@ export function labelOf(record: WriteRecord): string {
       return `Subscription group ${record.payload.groupId} ${record.payload.action}`;
     case 'marker':
       return 'The tracking_opted_out marker';
+    case 'exposures':
+      return 'Flag exposures';
   }
 }
 
@@ -143,7 +145,7 @@ function isRecord(raw: any): raw is WriteRecord {
   return (
     !!raw &&
     typeof raw === 'object' &&
-    (raw.kind === 'alias' || raw.kind === 'subscription' || raw.kind === 'group' || raw.kind === 'marker') &&
+    (raw.kind === 'alias' || raw.kind === 'subscription' || raw.kind === 'group' || raw.kind === 'marker' || raw.kind === 'exposures') &&
     !!raw.payload &&
     typeof raw.payload === 'object' &&
     typeof raw.payload.anonymousId === 'string'

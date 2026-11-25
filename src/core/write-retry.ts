@@ -28,6 +28,15 @@ export type WriteRecord =
       payload: { groupId: string; channel: any; action: 'subscribe' | 'unsubscribe'; userId?: string; anonymousId: string };
     }
   | {
+      /**
+       * A flag exposures batch the server did not take at once (1.4.0-beta.13):
+       * the request body as sent - identity, session, exposures and its
+       * `idempotencyKey` - retried as it is.
+       */
+      kind: 'exposures';
+      payload: { anonymousId: string; userId?: string; [field: string]: unknown };
+    }
+  | {
       /** The `tracking_opted_out` profile marker (contract items 33 and 36). */
       kind: 'marker';
       payload: { value: boolean; userId?: string; anonymousId: string };

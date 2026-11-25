@@ -65,7 +65,7 @@ import type { Logger } from '../utils/logger';
 import type { InAppAuthProvider } from './inapp';
 import type { PlacementConsent } from './placements';
 import { sdkIdentityHeaders } from './config';
-import { currentPageUrl, PAGE_CONTEXT_CAPABILITY, type PageContextTracker } from './page-context';
+import { currentPageSearch, currentPageUrl, PAGE_CONTEXT_CAPABILITY, PAGE_QUERY_CAPABILITY, type PageContextTracker } from './page-context';
 import { eventNames, isDeferred, parseShowWhen, type RecheckEvent, type ShowWhenMoments } from './show-when';
 
 export const PAGE_EDIT_OPERATIONS = ['replace_text', 'replace_image', 'replace_link', 'hide', 'insert_placement'] as const;
@@ -297,6 +297,8 @@ export interface PageEditExperienceWire {
   edits: PageEditWire[];
   /** Show when (D465): the moment its edits are applied (control: the moment it counts as viewed); absent = on load. */
   showWhen?: unknown;
+  /** The campaign has a URL parameter rule: this answer is for this query string only - never replayed from the cache. */
+  queryScoped?: boolean;
 }
 
 export interface PageEditsResponse {
@@ -744,9 +746,9 @@ export class PageEditManager {
       ...(personal ? { sessionId: this.session.getSessionId() } : {}),
       deviceType: 'web',
       locale: typeof navigator !== 'undefined' ? navigator.language : undefined,
-      capabilities: [PAGE_CONTEXT_CAPABILITY, PAGE_EDITS_CAPABILITY],
+      capabilities: [PAGE_CONTEXT_CAPABILITY, PAGE_EDITS_CAPABILITY, PAGE_QUERY_CAPABILITY],
       trackingConsent: consent,
-      context: this.page ? this.page.current() : { url, pageVariables: {}, dataLayer: {} },
+      context: this.page ? this.page.current() : { url, pageVariables: {}, dataLayer: {}, search: currentPageSearch() },
       ...(recheckEvent ? { recheckEvent } : {}),
     };
     const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
@@ -986,7 +988,8 @@ export class PageEditManager {
         at: Date.now(),
         ttl: (ttlSeconds && ttlSeconds > 0 ? ttlSeconds : DEFAULT_TTL_SECONDS) * 1000,
         experiences: experiences
-          .filter((x) => !x.wire.isControl)
+          // An experience that depends on the query string (URL parameter rule) is never replayed from the cache.
+          .filter((x) => !x.wire.isControl && !x.wire.queryScoped)
           .map((x) => ({ ...x.wire, deliveryToken: null, edits: x.edits.filter((e) => !e.personalized) }))
           .filter((x) => x.edits.length),
       };

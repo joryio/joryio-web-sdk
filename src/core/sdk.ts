@@ -646,7 +646,7 @@ export class JoryioSDK {
         attributes: () => this.identity.getAttributes(),
         // A batch the server did not take goes to the persisted outbox, as it
         // was sent (1.4.0-beta.13); waiting there counts as already exposed.
-        enqueueExposures: (body) => this.enqueueExposures(body),
+        enqueueExposures: (body, retryAfterMs) => this.enqueueExposures(body, retryAfterMs),
         pendingExposures: () => this.outbox.records().filter((r) => r.kind === 'exposures').map((r) => r.payload),
       },
       this.network,
@@ -1280,8 +1280,12 @@ export class JoryioSDK {
    * A flag exposures batch the server did not take: into the outbox as it was
    * sent. At most FLAG_EXPOSURE_MARKS_MAX exposures wait there (the oldest
    * batch goes first), so exposures never crowd out the profile writes.
+   *
+   * It counts as having failed once (1.4.0-beta.14): its first outbox attempt
+   * waits the first backoff step, or the failed send's Retry-After when
+   * longer - never the immediate re-send the kick after enqueue used to make.
    */
-  private enqueueExposures(body: Record<string, unknown>): void {
+  private enqueueExposures(body: Record<string, unknown>, retryAfterMs?: number): void {
     const count = () => this.outbox.records().reduce((n, r) => n + (r.kind === 'exposures' ? exposureMarks(r.payload).length : 0), 0);
     const incoming = exposureMarks(body).length;
     while (count() + incoming > FLAG_EXPOSURE_MARKS_MAX) {
@@ -1289,7 +1293,10 @@ export class JoryioSDK {
       if (!oldest) break;
       this.outbox.cancel((e) => e === oldest);
     }
-    this.outbox.enqueue({ kind: 'exposures', payload: body as Extract<WriteRecord, { kind: 'exposures' }>['payload'] });
+    this.outbox.enqueue(
+      { kind: 'exposures', payload: body as Extract<WriteRecord, { kind: 'exposures' }>['payload'] },
+      { afterFailedSend: true, retryAfterMs },
+    );
   }
 
   /** The opt-out marker's attribute write: the switch's value, `true` or `false`. */

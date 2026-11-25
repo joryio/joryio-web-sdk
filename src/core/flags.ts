@@ -25,6 +25,8 @@
  *   other than 408 / 429, which no retry would change). A batch that got no
  *   answer, a 5xx, a 408 or a 429 is handed, with the SAME body and
  *   `idempotencyKey`, to the SDK's persisted write outbox (kind `exposures`),
+ *   as having failed once - its first outbox attempt waits the first backoff
+ *   step, or the answer's Retry-After when longer (1.4.0-beta.14) -
  *   which retries it on its backoff, across reloads, and discards it on
  *   wipeData(), an opt-out or a denied consent; its marks are stored when the
  *   outbox settles it. While it waits there it counts as already exposed (its
@@ -137,8 +139,12 @@ interface FlagsAuth {
 interface FlagsRuntime {
   /** true when the SDK may send (initialized, consent granted, not suspended). */
   canSend: () => boolean;
-  /** Hand a batch the server did not take to the persisted write outbox (same body, same key). */
-  enqueueExposures?: (body: Record<string, unknown>) => void;
+  /**
+   * Hand a batch the server did not take to the persisted write outbox (same
+   * body, same key), with that answer's Retry-After: its first outbox attempt
+   * waits the first backoff step, or the Retry-After when longer.
+   */
+  enqueueExposures?: (body: Record<string, unknown>, retryAfterMs?: number) => void;
   /** The bodies of the exposure batches waiting in the write outbox. */
   pendingExposures?: () => Array<Record<string, unknown>>;
   requestTimeoutMs?: number;
@@ -435,8 +441,9 @@ export class FlagsManager {
   private async sendBatch(batch: ExposureBatch): Promise<void> {
     const body = { ...batch.body, exposures: batch.exposures, idempotencyKey: batch.idempotencyKey };
     let status = 0;
+    let retryAfterMs: number | undefined;
     try {
-      status = (await this.request('/v1/flags/exposures', body, true)).status;
+      ({ status, retryAfterMs } = await this.request('/v1/flags/exposures', body, true));
     } catch (error) {
       this.logger.debug('Flag exposures failed', error);
     }
@@ -444,7 +451,9 @@ export class FlagsManager {
     if (exposureBatchSettled(status)) return this.storeMarks(batch.marks);
     // Not taken: the persisted outbox retries it, same body and key - unless
     // the data was wiped or sending stopped (opt-out, consent) meanwhile.
-    if (batch.wipe === this.wipes && this.runtime.canSend()) this.runtime.enqueueExposures?.(body);
+    // Its first outbox attempt waits (it failed once, and the server may have
+    // said when to come back): never an immediate second send.
+    if (batch.wipe === this.wipes && this.runtime.canSend()) this.runtime.enqueueExposures?.(body, retryAfterMs);
   }
 
   private subjectKey(): string {

@@ -41,6 +41,7 @@ import {
   classifyWriteResponse,
   writeAttemptsExhausted,
   writeRetryDelay,
+  WRITE_MAX_RETRY_DELAY_MS,
 } from './write-retry';
 
 /** Where the outbox lives. */
@@ -75,6 +76,14 @@ export interface OutboxEntry {
   failures: number;
   /** Not before this time (backoff, Retry-After). */
   notBefore: number;
+  /**
+   * When the write was handed over after its own direct send failed (flag
+   * exposures, 1.4.0-beta.14): its first outbox attempt waits until then -
+   * the first backoff step, or the server's Retry-After when longer. Stored
+   * with the write, so a reload waits it out too; the outbox's later
+   * backoffs stay per page view, as for every write.
+   */
+  firstAttemptNotBefore?: number;
   /** When the write was made (epoch ms): orders writes of several tabs in the shared store. */
   createdAt: number;
 }
@@ -156,6 +165,7 @@ function isRecord(raw: any): raw is WriteRecord {
 function entryFromStored(raw: any): OutboxEntry | null {
   if (!raw || !isRecord(raw.record)) return null;
   const count = (n: any) => (Number.isInteger(n) && n >= 0 ? n : 0);
+  const firstAttemptNotBefore = storedNotBefore(raw.firstAttemptNotBefore);
   return {
     id: typeof raw.id === 'string' ? raw.id : generateUUID(),
     record: raw.record,
@@ -163,11 +173,36 @@ function entryFromStored(raw: any): OutboxEntry | null {
     attempts: count(raw.attempts),
     notFoundAttempts: count(raw.notFoundAttempts),
     failures: count(raw.failures),
-    // A new page view tries again now.
-    notBefore: 0,
+    // A new page view tries again now - unless the write was handed over
+    // after a failed direct send and its first wait is not over.
+    notBefore: firstAttemptNotBefore ?? 0,
+    ...(firstAttemptNotBefore !== undefined ? { firstAttemptNotBefore } : {}),
     // Stored by an earlier build: older than anything made now.
     createdAt: typeof raw.createdAt === 'number' && Number.isFinite(raw.createdAt) ? raw.createdAt : 0,
   };
+}
+
+/**
+ * A stored first-attempt time still ahead, and within the longest wait - one
+ * further away than that means the clock moved, and the write goes now.
+ */
+function storedNotBefore(value: unknown, now: number = Date.now()): number | undefined {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return undefined;
+  if (value <= now || value - now > WRITE_MAX_RETRY_DELAY_MS) return undefined;
+  return value;
+}
+
+/** Options of WriteOutbox.enqueue(). */
+export interface EnqueueOptions {
+  /**
+   * The write's own direct send just failed (no answer, 5xx, 408, 429): it
+   * counts as having failed once, so its first outbox attempt waits the first
+   * backoff step - or `retryAfterMs`, the server's Retry-After, when longer
+   * (capped at WRITE_MAX_RETRY_DELAY_MS). Only this write waits; the others
+   * in the outbox go as before.
+   */
+  afterFailedSend?: boolean;
+  retryAfterMs?: number;
 }
 
 export class WriteOutbox {
@@ -201,17 +236,22 @@ export class WriteOutbox {
   }
 
   /** Queue a write (after the caller checked it may be made at all). */
-  enqueue(record: WriteRecord): void {
+  enqueue(record: WriteRecord, options: EnqueueOptions = {}): void {
     if (this.destroyed) return;
+    const now = Date.now();
+    // Handed over after a failed direct send: failed once already, so the
+    // kick below does not re-send it a few milliseconds later.
+    const firstAttemptNotBefore = options.afterFailedSend ? now + writeRetryDelay(1, options.retryAfterMs) : undefined;
     const entry: OutboxEntry = {
       id: generateUUID(),
       record,
       withdrawal: isWithdrawal(record),
       attempts: 0,
       notFoundAttempts: 0,
-      failures: 0,
-      notBefore: 0,
-      createdAt: Date.now(),
+      failures: options.afterFailedSend ? 1 : 0,
+      notBefore: firstAttemptNotBefore ?? 0,
+      ...(firstAttemptNotBefore !== undefined ? { firstAttemptNotBefore } : {}),
+      createdAt: now,
     };
     this.knownIds.add(entry.id);
     const subject = subjectOf(record);
@@ -368,6 +408,9 @@ export class WriteOutbox {
       }
       blocked.add(key);
       if (entry === this.inFlight || this.safeGate(entry) !== 'send') continue;
+      // Still waiting out its first wait (a failed direct send, a
+      // Retry-After): stored, and sent by a later page view once it is over.
+      if (entry.firstAttemptNotBefore !== undefined && entry.firstAttemptNotBefore > now) continue;
       const handed = this.handedOffAt.get(entry.id);
       if (handed !== undefined && now - handed < UNLOAD_HANDOFF_WINDOW_MS) continue;
       try {
@@ -415,6 +458,8 @@ export class WriteOutbox {
       }
 
       const owner = this.deps.resolveOwner(ownerOf(entry.record));
+      // Its first wait is over: later waits are the outbox's own backoff.
+      delete entry.firstAttemptNotBefore;
       const res = await this.deps.send(entry, owner);
       // Discarded while on the wire (opt-out, wipe): its answer is moot.
       if (!this.entries.includes(entry)) return;
@@ -646,6 +691,7 @@ export class WriteOutbox {
           attempts: e.attempts,
           notFoundAttempts: e.notFoundAttempts,
           failures: e.failures,
+          ...(e.firstAttemptNotBefore !== undefined ? { firstAttemptNotBefore: e.firstAttemptNotBefore } : {}),
           createdAt: e.createdAt,
         })),
       );

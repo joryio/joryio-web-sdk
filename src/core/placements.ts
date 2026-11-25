@@ -50,7 +50,7 @@
 
 import { JoryioSubscription, joryioSubscription } from './subscription';
 import { bucketHash } from '../utils/bucket-hash';
-import { currentPageUrl, PAGE_CONTEXT_CAPABILITY, type PageContextTracker } from './page-context';
+import { currentPageUrl, PAGE_CONTEXT_CAPABILITY, PAGE_QUERY_CAPABILITY, type PageContextTracker } from './page-context';
 import { Logger } from '../utils/logger';
 import { eventNames, isDeferred, parseShowWhen, type RecheckEvent, type ShowWhenMoments } from './show-when';
 import { sdkIdentityHeaders } from './config';
@@ -190,6 +190,11 @@ export interface PlacementWire {
    * and asked again on a route change.
    */
   pageScoped?: boolean;
+  /**
+   * A campaign of this placement has a URL parameter rule: the answer is for
+   * this page's query string too. Kept in memory with it, never persisted.
+   */
+  queryScoped?: boolean;
   /** Show when (D465), on a control answer only: the moment the held-out treatment would have shown. */
   showWhen?: unknown;
   /** Control exposures to report once their moment came and the spot was viewable. */
@@ -296,6 +301,8 @@ interface CacheEntry {
   fetchedAt: number;
   /** The page it was answered for (origin + path); matters only when `pageScoped`. */
   url?: string | null;
+  /** The query string it was answered for; matters only when `queryScoped`. Memory only, never persisted. */
+  search?: string;
 }
 
 interface Waiter {
@@ -798,9 +805,15 @@ export class PlacementManager {
     return this.page ? this.page.current().url : currentPageUrl();
   }
 
+  /** The current query string (for a `queryScoped` answer); in memory only. */
+  private currentSearch(): string | undefined {
+    return this.page?.current().search;
+  }
+
   /** The rate-limit key: per page for a page-scoped placement, so a route change can ask again at once. */
   private rateKey(key: string): string {
-    return this.cache.get(key)?.placement.pageScoped || this.pageScopedKeys.has(key) ? `${key}\u0000${this.currentUrl() ?? ''}` : key;
+    const base = this.cache.get(key)?.placement.pageScoped || this.pageScopedKeys.has(key) ? `${key}\u0000${this.currentUrl() ?? ''}` : key;
+    return this.cache.get(key)?.placement.queryScoped ? `${base}\u0000${this.currentSearch() ?? ''}` : base;
   }
   private pageScopedKeys = new Set<string>();
 
@@ -808,6 +821,7 @@ export class PlacementManager {
     const entry = this.cache.get(key);
     if (!entry) return null;
     if (entry.placement.pageScoped && entry.url !== this.currentUrl()) return null;
+    if (entry.placement.queryScoped && entry.search !== this.currentSearch()) return null;
     const ttl = (entry.placement.ttlSeconds || DEFAULT_TTL_SECONDS) * 1000;
     return nowMs() - entry.fetchedAt < ttl ? entry : null;
   }
@@ -900,6 +914,7 @@ export class PlacementManager {
       });
     };
     const askedFor = this.currentUrl();
+    const askedSearch = this.currentSearch();
 
     const shown: Record<string, string[]> = {};
     for (const mount of this.mounts) {
@@ -959,7 +974,7 @@ export class PlacementManager {
         const wire = data.placements[key] || { placementKey: key, items: [] };
         const normalized = this.normalize(key, wire);
         const before = this.cache.get(key);
-        this.cache.set(key, { placement: normalized, fetchedAt, url: askedFor });
+        this.cache.set(key, { placement: normalized, fetchedAt, url: askedFor, ...(normalized.queryScoped ? { search: askedSearch } : {}) });
         if (normalized.pageScoped) this.pageScopedKeys.add(key);
         else this.pageScopedKeys.delete(key);
         // The server's answer already applied the dismissal rule.
@@ -981,7 +996,7 @@ export class PlacementManager {
 
   private capabilities(): string[] {
     const caps = ['placements', 'content.native', 'content.data'];
-    if (this.page) caps.push(PAGE_CONTEXT_CAPABILITY);
+    if (this.page) caps.push(PAGE_CONTEXT_CAPABILITY, PAGE_QUERY_CAPABILITY);
     if (this.runtime.allowHtml()) caps.push('content.html');
     return caps;
   }
@@ -997,6 +1012,7 @@ export class PlacementManager {
       controlToken: wire.controlToken || null,
       items,
       ...(wire.pageScoped === true ? { pageScoped: true } : {}),
+      ...(wire.queryScoped === true ? { queryScoped: true } : {}),
       ...(wire.isControl === true && wire.showWhen != null ? { showWhen: wire.showWhen } : {}),
       ...(Array.isArray(wire.deferredControls) && wire.deferredControls.length
         ? { deferredControls: wire.deferredControls.filter((d) => d && typeof d.controlToken === 'string' && d.controlToken) }
@@ -1776,7 +1792,8 @@ export class PlacementManager {
       if (typeof sessionStorage === 'undefined') return;
       const entries: Record<string, CacheEntry> = {};
       this.cache.forEach((entry, key) => {
-        entries[key] = entry;
+        // An answer for a query string stays in memory: the query string is never stored.
+        if (!entry.placement.queryScoped) entries[key] = entry;
       });
       sessionStorage.setItem(placementsStorageKey(this.sdkKey), JSON.stringify({ subject: this.subjectKey(), entries }));
     } catch {

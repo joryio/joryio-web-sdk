@@ -84,7 +84,9 @@ describe('page edits', () => {
     await flush();
     const req = calls.find((c) => c.path === '/api/v1/in-app/page-edits')!;
     expect(req.body.context.url).toBe('https://shop.example/products/shoes');
-    expect(req.body.capabilities).toEqual(['page_context', 'page_edits']);
+    expect(req.body.capabilities).toEqual(['page_context', 'page_edits', 'page_query']);
+    // The query string goes on its own, for URL parameter rules (evaluation only on the server).
+    expect(typeof req.body.context.search).toBe('string');
     const h1 = document.querySelector('#hero h1')!;
     expect(h1.textContent).toBe('<b>Hi Ada</b>'); // text is text
     expect(h1.querySelector('b')).toBeNull();
@@ -209,6 +211,32 @@ describe('page edits', () => {
     expect(document.querySelector('.promo')!.textContent).toBe('Static'); // before any answer
     expect(document.querySelector('#hero h1')!.textContent).toBe('Welcome');
     expect(tracks()).toHaveLength(1); // the cached apply reports nothing
+    second.destroy();
+  });
+
+  it('an experience for a URL parameter rule (queryScoped) is applied but never replayed from the cache', async () => {
+    answer = () => ({
+      body: {
+        success: true,
+        experiences: [
+          experience([{ id: 'e1', selector: '.promo', operation: 'replace_text', value: 'TestOnly' }], { id: 'q1', queryScoped: true }),
+          experience([{ id: 'e2', selector: '#hero h1', operation: 'replace_text', value: 'Static' }], { id: 'c2' }),
+        ],
+      },
+    });
+    const first = make();
+    first.start();
+    await flush();
+    await flush();
+    expect(document.querySelector('.promo')!.textContent).toBe('TestOnly');
+    first.destroy();
+    expect(sessionStorage.getItem(KEYS.answers)).not.toMatch(/TestOnly/);
+    expect(sessionStorage.getItem(KEYS.answers)).toMatch(/Static/);
+    answer = () => ({ delayMs: 10_000, body: { success: true, experiences: [] } });
+    const second = make();
+    second.start();
+    expect(document.querySelector('.promo')!.textContent).toBe('Promo'); // not from the cache
+    expect(document.querySelector('#hero h1')!.textContent).toBe('Static');
     second.destroy();
   });
 

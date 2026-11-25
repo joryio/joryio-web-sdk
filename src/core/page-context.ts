@@ -15,12 +15,17 @@
  */
 
 export const PAGE_URL_OPERATORS = ['equals', 'contains', 'matches'] as const;
-export const PAGE_VARIABLE_SOURCES = ['page', 'data_layer', 'utm_session', 'utm_first_touch'] as const;
+/** `query` = a parameter of the CURRENT page's address; its query string goes as `context.search` (page_query). */
+export const PAGE_VARIABLE_SOURCES = ['page', 'data_layer', 'utm_session', 'utm_first_touch', 'query'] as const;
 /** The UTM fields a `utm_*` rule names; reported as `context.utm.session` / `.firstTouch` (never the query string). */
 export const PAGE_UTM_KEYS = ['source', 'medium', 'campaign', 'term', 'content'] as const;
 export const PAGE_VARIABLE_OPERATORS = ['equals', 'not_equals', 'contains', 'exists', 'not_exists', 'gt', 'lt'] as const;
 export const PAGE_TRIGGER_TYPES = ['page_view', 'exit_intent', 'scroll_depth', 'time_on_page'] as const;
 export const PAGE_CONTEXT_CAPABILITY = 'page_context';
+/** This build sends `context.search` (the page's query string) for `query` (URL parameter) rules. */
+export const PAGE_QUERY_CAPABILITY = 'page_query';
+/** A longer query string is not sent: `query` rules then fail closed on that page. The server's cap is the same. */
+export const PAGE_SEARCH_MAX_LENGTH = 2048;
 
 /** Variables per source this SDK reports; the server reads the same number. */
 export const PAGE_CONTEXT_MAX_VARIABLES = 20;
@@ -54,6 +59,15 @@ export interface PageContext {
   dataLayer: Record<string, PageVariableValue>;
   /** The UTM the SDK recorded (absent when none, or UTM capture is off). */
   utm?: PageUtm;
+  /**
+   * The current page's query string (`location.search`, read when the
+   * context is built - never stored). Sent for URL parameter rules; the
+   * server uses it for that evaluation only. Absent when longer than
+   * PAGE_SEARCH_MAX_LENGTH.
+   */
+  search?: string;
+  /** `search` parsed (parsePageSearch), for the matcher. Absent = a `query` rule never holds (fail closed). */
+  query?: Record<string, string[]>;
 }
 
 // ── The matcher (same as the backend) ─────────────────────────────────────────
@@ -117,7 +131,42 @@ export function pageUrlRuleMatches(rule: PageUrlRule, url: string): boolean {
   }
 }
 
+function valueMatches(op: string, has: boolean, actual: PageVariableValue | undefined, expected: unknown): boolean {
+  switch (op) {
+    case 'exists':
+      return has;
+    case 'not_exists':
+      return !has;
+    case 'equals':
+      return has && String(actual).toLowerCase() === String(expected ?? '').toLowerCase();
+    case 'not_equals':
+      return !has || String(actual).toLowerCase() !== String(expected ?? '').toLowerCase();
+    case 'contains':
+      return has && String(actual).toLowerCase().includes(String(expected ?? '').toLowerCase());
+    case 'gt':
+    case 'lt': {
+      const a = Number(actual);
+      const b = Number(expected);
+      if (!has || !Number.isFinite(a) || !Number.isFinite(b)) return false;
+      return op === 'gt' ? a > b : a < b;
+    }
+    default:
+      return false;
+  }
+}
+
+/** A `query` rule: exact (case-sensitive) name; repeated = any value matches, `not_equals` = none equals. */
+function queryRuleMatches(rule: PageVariableRule, ctx: PageContext): boolean {
+  if (!ctx.query) return false;
+  const has = Object.prototype.hasOwnProperty.call(ctx.query, rule.key);
+  const values = has && Array.isArray(ctx.query[rule.key]) ? ctx.query[rule.key] : [];
+  if (rule.op === 'exists' || rule.op === 'not_exists') return valueMatches(rule.op, has, undefined, rule.value);
+  if (rule.op === 'not_equals') return !values.some((v) => valueMatches('equals', true, v, rule.value));
+  return values.some((v) => valueMatches(rule.op, true, v, rule.value));
+}
+
 function variableRuleMatches(rule: PageVariableRule, ctx: PageContext): boolean {
+  if (rule.source === 'query') return queryRuleMatches(rule, ctx);
   const bag: Record<string, PageVariableValue> | undefined =
     rule.source === 'data_layer'
       ? ctx.dataLayer
@@ -130,28 +179,7 @@ function variableRuleMatches(rule: PageVariableRule, ctx: PageContext): boolean 
             : undefined;
   if (!bag) return false; // an unknown source never matches (fail closed)
   const has = Object.prototype.hasOwnProperty.call(bag, rule.key);
-  const actual = has ? bag[rule.key] : undefined;
-  switch (rule.op) {
-    case 'exists':
-      return has;
-    case 'not_exists':
-      return !has;
-    case 'equals':
-      return has && String(actual).toLowerCase() === String(rule.value ?? '').toLowerCase();
-    case 'not_equals':
-      return !has || String(actual).toLowerCase() !== String(rule.value ?? '').toLowerCase();
-    case 'contains':
-      return has && String(actual).toLowerCase().includes(String(rule.value ?? '').toLowerCase());
-    case 'gt':
-    case 'lt': {
-      const a = Number(actual);
-      const b = Number(rule.value);
-      if (!has || !Number.isFinite(a) || !Number.isFinite(b)) return false;
-      return rule.op === 'gt' ? a > b : a < b;
-    }
-    default:
-      return false;
-  }
+  return valueMatches(rule.op, has, has ? bag[rule.key] : undefined, rule.value);
 }
 
 export function hasPageTargeting(pt: PageTargeting | null | undefined): boolean {
@@ -183,6 +211,35 @@ export function currentPageUrl(): string | null {
     return loc && loc.origin && loc.origin !== 'null' ? `${loc.origin}${loc.pathname}` : null;
   } catch {
     return null;
+  }
+}
+
+/**
+ * `?a=1&b=2` -> `{ a: ['1'], b: ['2'] }` (URLSearchParams: decoded, `+` is a
+ * space), as the server parses `context.search`. Null-prototype, so a
+ * parameter named `__proto__` is just a name. Undefined when not a string or
+ * over PAGE_SEARCH_MAX_LENGTH.
+ */
+export function parsePageSearch(raw: unknown): Record<string, string[]> | undefined {
+  if (typeof raw !== 'string' || raw.length > PAGE_SEARCH_MAX_LENGTH) return undefined;
+  const out: Record<string, string[]> = Object.create(null);
+  try {
+    new URLSearchParams(raw).forEach((value, name) => {
+      (out[name] = out[name] || []).push(value);
+    });
+  } catch {
+    return undefined;
+  }
+  return out;
+}
+
+/** The current page's query string, '' when none, undefined when over the cap or unreadable. */
+export function currentPageSearch(): string | undefined {
+  try {
+    const search = typeof window !== 'undefined' && window.location ? window.location.search || '' : '';
+    return search.length <= PAGE_SEARCH_MAX_LENGTH ? search : undefined;
+  } catch {
+    return undefined;
   }
 }
 
@@ -356,7 +413,8 @@ export class PageContextTracker {
       }
     }
     const utm = this.utm();
-    return { url: this.url, pageVariables, dataLayer, ...(utm ? { utm } : {}) };
+    const search = currentPageSearch();
+    return { url: this.url, pageVariables, dataLayer, ...(utm ? { utm } : {}), ...(search !== undefined ? { search } : {}) };
   }
 
   /** Scroll depth (max percent reached) and visible seconds on this page so far. */

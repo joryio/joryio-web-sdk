@@ -7,6 +7,8 @@ import {
   hasPageTargeting,
   isPageTrigger,
   PAGE_CONTEXT_CAPABILITY,
+  PAGE_QUERY_CAPABILITY,
+  parsePageSearch,
   pageTargetingMatches,
   pageTriggerMet,
   type PageContextTracker,
@@ -536,6 +538,8 @@ export class InAppMessagingManager {
     if (this.allowHtmlJsInAppMessages) caps.push('content.html');
     // `page_context`: this build checks a campaign's page rules and fires page triggers.
     if (this.page) caps.push(PAGE_CONTEXT_CAPABILITY);
+    // `page_query`: the context carries the page's query string (`search`) for URL parameter rules.
+    if (this.page) caps.push(PAGE_QUERY_CAPABILITY);
     return caps;
   }
 
@@ -559,7 +563,9 @@ export class InAppMessagingManager {
   /** Whether the current page allows this campaign. No rules = yes; rules and no page tracker = no. */
   private pageAllows(campaign: InAppCampaign): boolean {
     if (!hasPageTargeting(campaign.pageTargeting)) return true;
-    return !!this.page && pageTargetingMatches(campaign.pageTargeting, this.page.current());
+    if (!this.page) return false;
+    const ctx = this.page.current();
+    return pageTargetingMatches(campaign.pageTargeting, { ...ctx, query: parsePageSearch(ctx.search) });
   }
 
   private onPageSignal(signal: PageSignal): void {

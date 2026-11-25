@@ -13,7 +13,10 @@ import {
   PAGE_VARIABLE_OPERATORS,
   PAGE_VARIABLE_SOURCES,
   PAGE_CONTEXT_CAPABILITY,
+  PAGE_QUERY_CAPABILITY,
   PAGE_UTM_KEYS,
+  PAGE_SEARCH_MAX_LENGTH,
+  parsePageSearch,
   TOUCH_EXIT_INTENT,
 } from './page-context';
 
@@ -29,11 +32,65 @@ describe('page context', () => {
 
   it('pins the wire values (the backend pins the same list)', () => {
     expect(PAGE_URL_OPERATORS).toEqual(['equals', 'contains', 'matches']);
-    expect(PAGE_VARIABLE_SOURCES).toEqual(['page', 'data_layer', 'utm_session', 'utm_first_touch']);
+    expect(PAGE_VARIABLE_SOURCES).toEqual(['page', 'data_layer', 'utm_session', 'utm_first_touch', 'query']);
     expect(PAGE_UTM_KEYS).toEqual(['source', 'medium', 'campaign', 'term', 'content']);
     expect(PAGE_VARIABLE_OPERATORS).toEqual(['equals', 'not_equals', 'contains', 'exists', 'not_exists', 'gt', 'lt']);
     expect(PAGE_TRIGGER_TYPES).toEqual(['page_view', 'exit_intent', 'scroll_depth', 'time_on_page']);
     expect(PAGE_CONTEXT_CAPABILITY).toBe('page_context');
+    expect(PAGE_QUERY_CAPABILITY).toBe('page_query');
+  });
+
+  describe('URL parameter rules (source `query`)', () => {
+    const rule = (key: string, op: string, value?: unknown) => ({ variables: [{ source: 'query', key, op, value }] }) as any;
+    const here = () => {
+      const c = new PageContextTracker().current();
+      return { ...c, query: parsePageSearch(c.search) };
+    };
+
+    it('the context carries the current query string, read fresh each time; the URL still has none', () => {
+      history.replaceState(null, '', '/sale?jr_test=1&ref=Spring%20Sale');
+      tracker = new PageContextTracker();
+      expect(tracker.current()).toMatchObject({ url: 'https://shop.example/sale', search: '?jr_test=1&ref=Spring%20Sale' });
+      history.replaceState(null, '', '/next');
+      expect(tracker.current().search).toBe('');
+      history.replaceState(null, '', '/next?' + 'x'.repeat(PAGE_SEARCH_MAX_LENGTH));
+      expect(tracker.current()).not.toHaveProperty('search'); // over the cap: not sent, rules fail closed
+    });
+
+    it('parses like the server: decoded, repeated, null prototype', () => {
+      expect({ ...parsePageSearch('?jr_test=1&ref=Spring%20Sale&q=a+b&tag=a&tag=b&empty') }).toEqual({ jr_test: ['1'], ref: ['Spring Sale'], q: ['a b'], tag: ['a', 'b'], empty: [''] });
+      expect(Object.getPrototypeOf(parsePageSearch('?__proto__=x'))).toBeNull();
+      expect(parsePageSearch(undefined)).toBeUndefined();
+    });
+
+    it('match / no match, name case-sensitive, value ignoring case', () => {
+      history.replaceState(null, '', '/sale?jr_test=1&ref=Spring%20Sale');
+      expect(pageTargetingMatches(rule('jr_test', 'equals', '1'), here())).toBe(true);
+      expect(pageTargetingMatches(rule('jr_test', 'equals', '2'), here())).toBe(false);
+      expect(pageTargetingMatches(rule('JR_TEST', 'equals', '1'), here())).toBe(false);
+      expect(pageTargetingMatches(rule('ref', 'equals', 'spring sale'), here())).toBe(true);
+      expect(pageTargetingMatches(rule('ref', 'contains', 'SALE'), here())).toBe(true);
+    });
+
+    it('a repeated parameter matches when any value does; "is not" when none equals', () => {
+      history.replaceState(null, '', '/sale?tag=a&tag=b');
+      expect(pageTargetingMatches(rule('tag', 'equals', 'b'), here())).toBe(true);
+      expect(pageTargetingMatches(rule('tag', 'not_equals', 'b'), here())).toBe(false);
+      expect(pageTargetingMatches(rule('tag', 'not_equals', 'c'), here())).toBe(true);
+    });
+
+    it('a missing parameter, and only the current page counts', () => {
+      history.replaceState(null, '', '/sale?jr_test=1');
+      expect(pageTargetingMatches(rule('jr_test', 'exists'), here())).toBe(true);
+      history.replaceState(null, '', '/next');
+      expect(pageTargetingMatches(rule('jr_test', 'exists'), here())).toBe(false);
+      expect(pageTargetingMatches(rule('jr_test', 'not_exists'), here())).toBe(true);
+    });
+
+    it('fails closed for every operator without a parsed query string', () => {
+      const none = { url: 'https://shop.example/a', pageVariables: {}, dataLayer: {} };
+      for (const op of ['equals', 'not_equals', 'exists', 'not_exists']) expect(pageTargetingMatches(rule('jr_test', op, '1'), none)).toBe(false);
+    });
   });
 
   it('the URL is origin + path, never the query string or the fragment', () => {
@@ -307,7 +364,10 @@ describe('page context', () => {
       const ctx = tracker.current();
       expect(ctx.url).toBe('https://shop.example/products/shoes');
       expect(ctx.utm).toEqual({ session: { source: 'mail', medium: 'email' }, firstTouch: { source: 'google', campaign: 'brand' } });
-      expect(JSON.stringify(ctx)).not.toContain('?');
+      // The query string travels only as `search` (URL parameter rules); the UTM is the recorded fields.
+      const { search, ...rest } = ctx;
+      expect(search).toBe('?utm_source=mail');
+      expect(JSON.stringify(rest)).not.toContain('?');
     });
 
     it('no UTM (or capture off) = no utm key', () => {

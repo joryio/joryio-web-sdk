@@ -32,9 +32,11 @@ class FakePage {
 
 let calls: RecordedRequest[];
 let scoped = true;
+let queryScoped = false;
 beforeEach(() => {
   jest.useFakeTimers({ doNotFake: ['nextTick', 'setImmediate'] });
   scoped = true;
+  queryScoped = false;
   calls = installFetch((req) => ({
     status: 200,
     body: {
@@ -42,8 +44,9 @@ beforeEach(() => {
       placements: {
         home_hero: {
           placementKey: 'home_hero',
-          items: [{ id: `for ${req.body.context.url}`, kind: 'data', data: { headline: 'x' } }],
+          items: [{ id: `for ${req.body.context.url}${req.body.context.search ?? ''}`, kind: 'data', data: { headline: 'x' } }],
           ...(scoped ? { pageScoped: true } : {}),
+          ...(queryScoped ? { queryScoped: true } : {}),
         },
       },
     },
@@ -68,7 +71,30 @@ describe('placements and page context', () => {
     await get(m);
     expect(calls[0].body.context).toEqual({ url: 'https://shop.example/sale', pageVariables: { pageType: 'sale' }, dataLayer: {}, screen: null });
     expect(calls[0].body.capabilities).toContain('page_context');
+    expect(calls[0].body.capabilities).toContain('page_query');
     m.destroy();
+  });
+
+  it('URL parameter rules: the query string goes with the request; a queryScoped answer is for that query string, in memory only', async () => {
+    queryScoped = true;
+    const store = new Map<string, string>();
+    (globalThis as any).sessionStorage = { getItem: (k: string) => store.get(k) ?? null, setItem: (k: string, v: string) => store.set(k, v), removeItem: (k: string) => store.delete(k) };
+    const page = new FakePage();
+    page.ctx = { ...page.ctx, search: '?jr_test=1' };
+    const m = make(page);
+    expect((await get(m)).home_hero.items[0].id).toBe('for https://shop.example/sale?jr_test=1');
+    expect(calls[0].body.context.search).toBe('?jr_test=1');
+    await get(m);
+    expect(calls).toHaveLength(1); // same page, same query string: cached
+    page.ctx = { ...page.ctx, search: '' };
+    expect((await get(m)).home_hero.items[0].id).toBe('for https://shop.example/sale');
+    expect(calls).toHaveLength(2); // another query string: asked again
+    // Never persisted: nothing derived from the query string reaches sessionStorage.
+    expect(store.size).toBeGreaterThan(0); // the cache was written...
+    expect([...store.values()].join('')).not.toContain('jr_test'); // ...without the query string
+    expect([...store.values()].join('')).not.toContain('home_hero'); // or the answer for it
+    m.destroy();
+    delete (globalThis as any).sessionStorage;
   });
 
   it('a page-scoped answer is asked again on another page at once, and cached on its own page', async () => {

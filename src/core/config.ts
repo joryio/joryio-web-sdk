@@ -2,7 +2,23 @@
  * SDK Configuration Types and Defaults
  */
 
-export const SDK_VERSION = '1.3.3'; // keep in sync with package.json — the backend serves this in X-SDK-Version headers
+export const SDK_VERSION = '1.4.0'; // keep in sync with package.json (sdk-version-parity.spec.ts pins it)
+
+/**
+ * Sent on EVERY request to the API, so the dashboard can show which SDK
+ * version each app runs and when a newer one is out (D427). Same wire names
+ * on all five SDKs: `X-Joryio-SDK` is the platform (the header the backend's
+ * SDK-key guard and bot detection already read), `X-Joryio-SDK-Version` this
+ * build's version. The web SDK has no bridge, so it never sends
+ * `X-Joryio-SDK-Wrapper`. The public SDK routes allow these in CORS.
+ */
+export const SDK_PLATFORM_HEADER = 'X-Joryio-SDK';
+export const SDK_VERSION_HEADER = 'X-Joryio-SDK-Version';
+export const SDK_PLATFORM = 'web';
+
+export function sdkIdentityHeaders(): Record<string, string> {
+  return { [SDK_PLATFORM_HEADER]: SDK_PLATFORM, [SDK_VERSION_HEADER]: SDK_VERSION };
+}
 export const DEFAULT_API_ENDPOINT = 'https://api-eu1.joryio.com/api';
 
 /**
@@ -110,6 +126,13 @@ export interface InAppOptions {
    */
   allowHtmlJsInAppMessages?: boolean;
 
+  /**
+   * Fill every `<div data-joryio-placement="key">` on the page (and those added
+   * later) with its placement. On by default; off = only insertPlacement()
+   * draws. Placements work whether or not overlays (`enabled`) are on.
+   */
+  autoMountPlacements?: boolean;
+
   // Callback hooks
   onMessageDisplay?: (message: any) => void;
   onMessageClick?: (message: any, action: string) => void;
@@ -120,6 +143,48 @@ export interface InAppOptions {
 export interface InitConfig {
   // Required
   sdkKey: string;
+
+  /**
+   * Page context for targeting (D444 Phase 4): what the SDK may report about
+   * the page besides its URL (origin + path, never the query string). Nothing
+   * is read that is not listed here. Set the page's own variables with
+   * `setPageVariables()`.
+   */
+  pageContext?: {
+    /** Global variables to report, by name (`pageType`, `shop.page.type`). */
+    pageVariables?: string[];
+    /** dataLayer keys to report (`pageType`, `ecommerce.value`): the latest pushed value of each. */
+    dataLayerVariables?: string[];
+    /** The dataLayer array's global name. Default `dataLayer`. */
+    dataLayerName?: string;
+  };
+
+  /**
+   * Page edits on this site (D444 Phase 4). Default on: the SDK applies the
+   * page edits Joryio sends and opens the point-and-click editor when the
+   * dashboard asks. `false`: it never applies a page edit, never holds an
+   * element back and never loads the editor - whatever the server says.
+   * (Workspace-wide: Settings -> Placements -> Allow page edits on this website.)
+   */
+  pageEdits?: boolean;
+
+  /**
+   * Where the point-and-click editor's file is loaded from. Default: the
+   * folder `joryio.min.js` itself was loaded from (a beta at
+   * `sdk.joryio.com/web/1.4.0-beta.4/`, the npm package's `dist/` on a CDN),
+   * then the SDK host (`https://sdk.joryio.com/web/<version>/joryio-editor.min.js`,
+   * then `/web/<major>/`). Set it only when you host the SDK files yourself.
+   */
+  editorScriptUrl?: string;
+
+  /**
+   * Where the default card feed's file (`mountCardFeed`) is loaded from.
+   * Default: the folder `joryio.min.js` itself was loaded from, then the SDK
+   * host (`https://sdk.joryio.com/web/<version>/joryio-cards-ui.min.js`, then
+   * `/web/<major>/`), the first time the page mounts a feed. Set it only when
+   * you host the SDK files yourself.
+   */
+  cardsUiScriptUrl?: string;
 
   // API Configuration
   apiEndpoint?: string;
@@ -147,6 +212,26 @@ export interface InitConfig {
 
   // In-App Messaging
   inApp?: InAppOptions;
+
+  /**
+   * Does this site use Joryio web push? Decides whether the SDK reports the
+   * `push_permission` profile attribute on page load.
+   *
+   * - `true`: reported on page load (only when it changed since the server
+   *   last acknowledged it), so a segment can find visitors who have not
+   *   been asked yet (`not_determined`).
+   * - unset (default): reported only once this browser has used Joryio web
+   *   push - `push.subscribe()` was called or `push.prepare()` succeeded,
+   *   here or on an earlier page view, or the browser was registered for
+   *   push by an earlier SDK version.
+   * - `false`: never reported on page load. A `push.subscribe()` call (or a
+   *   successful `push.prepare()`) on the page still reports its outcome.
+   *
+   * A site that does not use web push sends nothing about it: the attribute
+   * used to be written for every new visitor, one request each and, for an
+   * anonymous visitor the SDK sends nothing else for, a profile of its own.
+   */
+  webPush?: boolean;
 
   // Storage
   persistQueue?: boolean;
@@ -181,6 +266,22 @@ export interface InitConfig {
   enableSdkAuthentication?: boolean;
   sdkAuthenticationToken?: string;
 
+  /**
+   * Storefront identity token (store plugins, D383): a token JORYIO minted
+   * for a signed-in store customer's browser, bound to one anonymous id (its
+   * `vid`). Attached as `X-Joryio-Auth` to ANONYMOUS requests only, and only
+   * while that anonymous id is this SDK's. Independent of
+   * `enableSdkAuthentication`. Not for sites with their own backend: those
+   * use SDK authentication.
+   */
+  storefrontIdentityToken?: string;
+  /**
+   * Called for a fresh storefront identity token when the one held is about
+   * to expire or the API refused it as expired. Resolve the new token, or
+   * null for none.
+   */
+  storefrontIdentityTokenProvider?: () => string | null | undefined | Promise<string | null | undefined>;
+
   // Debugging
   /** Log everything (`logLevel: 'debug'`) - unless `logLevel` is set too, which then wins. */
   enableDebug?: boolean;
@@ -194,14 +295,23 @@ export interface InitConfig {
   plugins?: Array<Plugin>;
 }
 
-export interface ResolvedConfig extends Required<Omit<InitConfig, 'userId' | 'plugins' | 'inApp' | 'sdkAuthenticationToken' | 'trackingConsent'>> {
+export interface ResolvedConfig extends Required<Omit<InitConfig, 'userId' | 'plugins' | 'inApp' | 'pageContext' | 'sdkAuthenticationToken' | 'trackingConsent' | 'webPush' | 'storefrontIdentityToken' | 'storefrontIdentityTokenProvider' | 'editorScriptUrl' | 'cardsUiScriptUrl'>> {
   userId?: string;
+  /** Undefined = the SDK host (see InitConfig.editorScriptUrl). */
+  editorScriptUrl?: string;
+  /** Undefined = the SDK host (see InitConfig.cardsUiScriptUrl). */
+  cardsUiScriptUrl?: string;
+  /** Undefined = not set by the app (see InitConfig.webPush). */
+  webPush?: boolean;
   /** Undefined = not set by the app (see InitConfig.trackingConsent). */
   trackingConsent?: 'granted' | 'denied' | 'pending';
   plugins: Array<Plugin>;
   inApp: Required<InAppOptions>;
+  pageContext: { pageVariables: string[]; dataLayerVariables: string[]; dataLayerName: string };
   // Optional — absent until the host app supplies a token.
   sdkAuthenticationToken?: string;
+  storefrontIdentityToken?: string;
+  storefrontIdentityTokenProvider?: InitConfig['storefrontIdentityTokenProvider'];
   /** Whether the logger prints at all: `enableDebug` or an explicit `logLevel`. */
   loggingEnabled: boolean;
 }
@@ -314,6 +424,7 @@ export function resolveConfig(config: InitConfig): ResolvedConfig {
       zIndex: config.inApp?.displayOptions?.zIndex || 999999,
     },
     allowHtmlJsInAppMessages: config.inApp?.allowHtmlJsInAppMessages === true,
+    autoMountPlacements: config.inApp?.autoMountPlacements !== false,
     onMessageDisplay: config.inApp?.onMessageDisplay || (() => {}),
     onMessageClick: config.inApp?.onMessageClick || (() => {}),
     onMessageDismiss: config.inApp?.onMessageDismiss || (() => {}),
@@ -339,6 +450,21 @@ export function resolveConfig(config: InitConfig): ResolvedConfig {
     trackPageProperties: config.trackPageProperties !== false,
     trackDeviceProperties: config.trackDeviceProperties !== false,
     inApp: inAppOptions,
+    pageContext: {
+      pageVariables: Array.isArray(config.pageContext?.pageVariables) ? config.pageContext!.pageVariables.filter((v) => typeof v === 'string') : [],
+      dataLayerVariables: Array.isArray(config.pageContext?.dataLayerVariables)
+        ? config.pageContext!.dataLayerVariables.filter((v) => typeof v === 'string')
+        : [],
+      dataLayerName:
+        typeof config.pageContext?.dataLayerName === 'string' && /^[A-Za-z_$][A-Za-z0-9_$]{0,63}$/.test(config.pageContext.dataLayerName)
+          ? config.pageContext.dataLayerName
+          : 'dataLayer',
+    },
+    pageEdits: config.pageEdits !== false,
+    editorScriptUrl: typeof config.editorScriptUrl === 'string' && /^https:\/\//i.test(config.editorScriptUrl) ? config.editorScriptUrl : undefined,
+    cardsUiScriptUrl: typeof config.cardsUiScriptUrl === 'string' && /^https:\/\//i.test(config.cardsUiScriptUrl) ? config.cardsUiScriptUrl : undefined,
+    // Tri-state on purpose: unset ("decide from this browser") is not `false`.
+    webPush: config.webPush === true ? true : config.webPush === false ? false : undefined,
     persistQueue: config.persistQueue !== false,
     // 0 is a real value ("no immediate retries"), so not `||`.
     maxRetries:
@@ -356,6 +482,9 @@ export function resolveConfig(config: InitConfig): ResolvedConfig {
         : undefined,
     enableSdkAuthentication: config.enableSdkAuthentication === true,
     sdkAuthenticationToken: config.sdkAuthenticationToken,
+    storefrontIdentityToken: typeof config.storefrontIdentityToken === 'string' && config.storefrontIdentityToken ? config.storefrontIdentityToken : undefined,
+    storefrontIdentityTokenProvider:
+      typeof config.storefrontIdentityTokenProvider === 'function' ? config.storefrontIdentityTokenProvider : undefined,
     enableDebug: config.enableDebug || false,
     // `enableDebug: true` alone means debug; an explicit `logLevel` wins (rule 58).
     logLevel: config.logLevel || (config.enableDebug ? 'debug' : 'error'),

@@ -12,6 +12,7 @@ import type {
   SdkAuthFailureInfo,
   SdkAuthFailureReason,
   SdkAuthFailureCallback,
+  StorefrontIdentityTokenProvider,
 } from './core/network';
 import { User, SubscriptionStatus } from './core/user';
 import type { SubscriptionChannel, SubscriptionPreferences } from './core/user';
@@ -60,6 +61,7 @@ export type {
   SdkAuthFailureInfo,
   SdkAuthFailureReason,
   SdkAuthFailureCallback,
+  StorefrontIdentityTokenProvider,
 };
 
 // Export SDK version
@@ -68,6 +70,45 @@ export { SDK_VERSION } from './core/config';
 // How long an in-app message must be visible before it counts as displayed
 // (the same constant on every Joryio SDK).
 export { IN_APP_DISPLAY_DWELL_MS } from './core/inapp';
+
+// Placements: spots inside the page filled per visitor (the same names and
+// values on every Joryio SDK).
+export { PLACEMENT_VIEWABLE_FRACTION, PLACEMENT_MIN_REFRESH_SECONDS, PLACEMENT_RETRY_AFTER_FAILURE_SECONDS } from './core/placements';
+export { PLACEMENT_PRODUCT_ELEMENT_PREFIX, PLACEMENT_PRODUCT_CARD_WIDTH, placementProductElementId } from './core/placements';
+export type {
+  Placement,
+  PlacementItem,
+  PlacementHandle,
+  PlacementContent,
+  PlacementEmptyBehavior,
+  PlacementItemKind,
+  InsertPlacementOptions,
+  PlacementsUpdatedCallback,
+} from './core/placements';
+
+// Show when: the moment a placement item or page edit is revealed (the same names and values on every Joryio SDK).
+export { SHOW_WHEN_KINDS } from './core/show-when';
+export type { ShowWhen, ShowWhenKind } from './core/show-when';
+
+// Links: the site-wide link handler (the same names and source values on every Joryio SDK).
+export type { JoryioLink, JoryioLinkSource, JoryioLinkHandler } from './core/links';
+
+// Content cards: the person's feed (the same names and values on every Joryio SDK).
+export { CARD_MIN_REFRESH_SECONDS, CARD_RETRY_AFTER_FAILURE_SECONDS, CARD_FEED_TTL_SECONDS } from './core/cards';
+export type {
+  Card,
+  CardFeed,
+  CardStateScope,
+  CardFeedHandle,
+  GetCardsOptions,
+  MountCardFeedOptions,
+  CardsUpdatedCallback,
+} from './core/cards';
+// The one subscription every on...Updated listener returns (the same name on every Joryio SDK).
+export type { JoryioSubscription } from './core/subscription';
+// Feature flags + remote config (the same names and values on every Joryio SDK).
+export { FLAGS_MIN_REFRESH_SECONDS, FLAG_SYNC_PUSH_VALUE } from './core/flags';
+export type { FlagResult, FlagValueType, FlagReason, FlagsUpdatedCallback } from './core/flags';
 
 // Default export for convenience
 export default JoryioSDK;

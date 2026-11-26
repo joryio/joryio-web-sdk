@@ -23,7 +23,8 @@ const readme = fs.readFileSync(path.join(ROOT, 'README.md'), 'utf8');
 /** Public instance methods of JoryioSDK, read from the source (TS privates are not visible at runtime). */
 function publicMethods(): string[] {
   const out = new Set<string>();
-  for (const m of sdkSrc.matchAll(/^ {2}(?:async )?([a-zA-Z]+)\(/gm)) {
+  // A generic method (getFlag<T>(...)) is a public method too.
+  for (const m of sdkSrc.matchAll(/^ {2}(?:async )?([a-zA-Z]+)(?:<[^>]*>)?\(/gm)) {
     if (m[1] !== 'constructor') out.add(m[1]);
   }
   return [...out].sort();

@@ -72,6 +72,11 @@ export class IdentityManager {
    */
   identify(userId: string, attributes?: UserAttributes): void {
     const previousUserId = this.userId;
+    // A DIFFERENT user: the previous user's attributes are not this one's
+    // (as on iOS and Android). They used to stay, so user A's attributes rode
+    // in user B's flags evaluate and in-app sync (1.4.0-beta.10 test). The
+    // same user again keeps them; anonymous -> identified keeps them too.
+    if (previousUserId && previousUserId !== userId) this.attributes = {};
     this.userId = userId;
     this.storage.set(USER_ID_KEY, userId);
 
@@ -85,14 +90,15 @@ export class IdentityManager {
   }
 
   /**
-   * Reset identity (logout)
+   * Reset identity (logout). `anonymousId`: the id to adopt instead of a new
+   * random one (resetTo, already validated by the caller).
    */
-  reset(): void {
+  reset(anonymousId?: string): void {
     this.logger.debug(`Resetting identity (was: ${this.userId || 'anonymous'})`);
 
     this.userId = null;
     this.attributes = {};
-    this.anonymousId = generateUUID();
+    this.anonymousId = anonymousId || generateUUID();
 
     this.storage.remove(USER_ID_KEY);
     this.storage.remove(USER_ATTRIBUTES_KEY);
@@ -106,7 +112,7 @@ export class IdentityManager {
    * take it over in memory. Storage already holds it.
    */
   adopt(anonymousId: string, userId: string | null): void {
-    if (anonymousId !== this.anonymousId) this.attributes = {};
+    if (anonymousId !== this.anonymousId || (this.userId && userId !== this.userId)) this.attributes = {};
     this.anonymousId = anonymousId;
     this.userId = userId;
   }

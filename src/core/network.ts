@@ -4,6 +4,7 @@
 
 import type { SubscriptionChannel } from './user';
 import { Logger } from '../utils/logger';
+import { sdkIdentityHeaders } from './config';
 
 export interface NetworkRequest {
   url: string;
@@ -274,6 +275,48 @@ export type SdkAuthFailureCallback = (
   info: SdkAuthFailureInfo,
 ) => void | string | Promise<void | string>;
 
+/** The issuer of a storefront identity token (Joryio-signed, D383). Wire value - same as the backend's. */
+export const STOREFRONT_IDENTITY_ISSUER = 'joryio-storefront';
+/** The 401 `error` the API answers for a refused storefront identity token. */
+export const STOREFRONT_IDENTITY_ERROR = 'storefront_identity_error';
+/** A storefront token this close to its expiry is not attached; a fresh one is asked for. */
+const STOREFRONT_TOKEN_MIN_LIFE_MS = 30_000;
+
+/**
+ * Supplies a fresh storefront identity token (the WordPress plugin's
+ * storefront script asks the store for a new customer proof and exchanges
+ * it). Resolve null when there is none - the visitor is then anonymous.
+ */
+export type StorefrontIdentityTokenProvider = () => string | null | undefined | Promise<string | null | undefined>;
+
+/**
+ * The storefront token's claims the SDK reads - WITHOUT verifying it (the API
+ * does): its issuer, the visitor id it is bound to, and its expiry.
+ */
+export function storefrontTokenClaims(token: string | undefined): { vid: string; exp: number } | null {
+  const c = jwtClaims(token);
+  if (!c || c.iss !== STOREFRONT_IDENTITY_ISSUER) return null;
+  if (typeof c.vid !== 'string' || !c.vid || typeof c.exp !== 'number') return null;
+  return { vid: c.vid, exp: c.exp };
+}
+
+/** The anonymous id a request body names (null: none, or an identified request). */
+export function anonymousIdOfBody(body: any): string | null {
+  if (!body || typeof body !== 'object') return null;
+  if (identifiedUserOf(body)) return null;
+  const ids = new Set<string>();
+  const add = (v: unknown) => {
+    if (typeof v === 'string' && v) ids.add(v);
+  };
+  add(body.anonymousId);
+  if (body.identify) add(body.identify.anonymousId);
+  for (const list of [body.events, body.impressions]) {
+    if (Array.isArray(list)) list.forEach((e: any) => e && add(e.anonymousId));
+  }
+  // Two visitors in one body: no single visitor to vouch for.
+  return ids.size === 1 ? (ids.values().next().value as string) : null;
+}
+
 export interface CircuitBreakerConfig {
   /** Number of consecutive failures before opening the circuit. Default: 5 */
   failureThreshold: number;
@@ -328,6 +371,19 @@ export class NetworkClient {
   private currentUserId: string | null = null;
 
   /**
+   * Storefront identity token (D383): Joryio-signed, bound to ONE visitor id
+   * (its `vid` claim). Attached to an ANONYMOUS request only, and only when
+   * the request's visitor is that `vid` and the visitor id this SDK uses now
+   * - never to an identified request, never after reset() changed the
+   * visitor. Independent of `enableSdkAuthentication`.
+   */
+  private storefrontToken: string | undefined;
+  private storefrontTokenProvider: StorefrontIdentityTokenProvider | null = null;
+  private storefrontRefresh: Promise<string | undefined> | null = null;
+  /** The SDK's current anonymous id (a getter: identity owns it). */
+  private anonymousIdSource: (() => string | null) | null = null;
+
+  /**
    * Set by a 402 `SDK_INGESTION_SUSPENDED`: the workspace's ingestion is
    * paused, so every further request this page makes would be refused the same
    * way. Stop asking for the rest of the session instead of hammering the API.
@@ -345,6 +401,108 @@ export class NetworkClient {
   }
 
   // --- SDK Authentication wiring ---------------------------------------
+
+  // --- Storefront identity token (D383) -------------------------------
+
+  /** Where the network client reads the SDK's current anonymous id. */
+  setAnonymousIdSource(source: (() => string | null) | null): void {
+    this.anonymousIdSource = source;
+  }
+
+  /** Set / replace the storefront identity token (undefined or '' forgets it). */
+  setStorefrontIdentityToken(token: string | null | undefined): void {
+    const next = typeof token === 'string' && token ? token : undefined;
+    if (next && !storefrontTokenClaims(next)) {
+      this.logger.warn('setStorefrontIdentityToken: not a storefront identity token - ignored');
+      return;
+    }
+    this.storefrontToken = next;
+  }
+
+  /** Register the provider asked for a fresh storefront token (expired, or refused as expired). */
+  setStorefrontIdentityTokenProvider(provider: StorefrontIdentityTokenProvider | null): void {
+    this.storefrontTokenProvider = provider;
+  }
+
+  /** reset() / wipeData(): the next visitor is not the store customer. */
+  clearStorefrontIdentityToken(): void {
+    this.storefrontToken = undefined;
+    this.storefrontRefresh = null;
+  }
+
+  /** True if a parsed response body is a `storefront_identity_error`. */
+  isStorefrontIdentityError(status: number, data: any): boolean {
+    return status === 401 && !!data && typeof data === 'object' && data.error === STOREFRONT_IDENTITY_ERROR;
+  }
+
+  /**
+   * The storefront token a request may carry, or undefined. `bodyAnonymousId`:
+   * the visitor the body names (anonymousIdOfBody); undefined when the caller
+   * has no body to read (it is then the current visitor).
+   */
+  private storefrontTokenFor(subjectUserId: string | null | undefined, bodyAnonymousId?: string | null): string | undefined {
+    const token = this.storefrontToken;
+    if (!token) return undefined;
+    const user = subjectUserId === undefined ? this.currentUserId : subjectUserId;
+    if (user) return undefined; // identified: the customer's own SDK Authentication, never this
+    const claims = storefrontTokenClaims(token);
+    const current = this.anonymousIdSource ? this.anonymousIdSource() : null;
+    if (!claims || !current || claims.vid !== current) return undefined;
+    if (bodyAnonymousId === null) return undefined;
+    if (bodyAnonymousId !== undefined && bodyAnonymousId !== claims.vid) return undefined;
+    if (claims.exp * 1000 - Date.now() < STOREFRONT_TOKEN_MIN_LIFE_MS) {
+      // About to expire: not sent (the API would refuse it); a fresh one is asked for.
+      void this.refreshStorefrontToken();
+      return undefined;
+    }
+    return token;
+  }
+
+  /**
+   * Ask the provider for a fresh token (one request at a time). Resolves the
+   * new token when it differs from the one held, else undefined.
+   */
+  refreshStorefrontToken(): Promise<string | undefined> {
+    if (!this.storefrontTokenProvider) return Promise.resolve(undefined);
+    if (this.storefrontRefresh) return this.storefrontRefresh;
+    const previous = this.storefrontToken;
+    const provider = this.storefrontTokenProvider;
+    this.storefrontRefresh = (async () => {
+      try {
+        const fresh = await Promise.resolve(provider());
+        if (typeof fresh === 'string' && fresh && storefrontTokenClaims(fresh)) {
+          this.storefrontToken = fresh;
+          return fresh !== previous ? fresh : undefined;
+        }
+      } catch (err) {
+        this.logger.warn('The storefront identity token provider failed:', err);
+      }
+      return undefined;
+    })().finally(() => {
+      this.storefrontRefresh = null;
+    });
+    return this.storefrontRefresh;
+  }
+
+  /**
+   * A 401 `storefront_identity_error`: `expired` asks the provider for a
+   * fresh token; anything else (invalid, vid_mismatch, revoked) drops the
+   * token - the visitor carries on as an ordinary anonymous visitor.
+   * Resolves true when the request should be retried once.
+   */
+  async handleStorefrontIdentityError(data: any): Promise<boolean> {
+    const reason = data && typeof data === 'object' ? data.reason : undefined;
+    this.logger.warn(`Storefront identity token refused (${reason || 'invalid'})`);
+    if (reason === 'expired') {
+      const before = this.storefrontToken;
+      const fresh = await this.refreshStorefrontToken();
+      if (fresh) return true;
+      if (this.storefrontToken === before) this.storefrontToken = undefined;
+      return true;
+    }
+    this.storefrontToken = undefined;
+    return true;
+  }
 
   /** Enable/disable SDK authentication (attach + refresh the auth JWT). */
   setSdkAuthenticationEnabled(enabled: boolean): void {
@@ -647,8 +805,8 @@ export class NetworkClient {
    * `subjectUserId`: the user the request is about - a logged-out user's
    * request carries THAT user's retired token, never the next user's.
    */
-  getSdkAuthHeaders(subjectUserId?: string | null): Record<string, string> {
-    const token = this.sdkAuthTokenFor(subjectUserId);
+  getSdkAuthHeaders(subjectUserId?: string | null, anonymousId?: string | null): Record<string, string> {
+    const token = this.sdkAuthTokenFor(subjectUserId) ?? this.storefrontTokenFor(subjectUserId, anonymousId);
     return token ? { [SDK_AUTH_HEADER]: token } : {};
   }
 
@@ -743,6 +901,8 @@ export class NetworkClient {
     }
     const forCurrentUser =
       request.subjectUserId === undefined || (request.subjectUserId || null) === this.currentUserId;
+    // The visitor the body names (D383: a storefront token goes only with its own visitor).
+    const bodyAnonymousId = request.body ? anonymousIdOfBody(request.body) : undefined;
 
     let lastError: Error | null = null;
     let lastStatus = 0;
@@ -752,12 +912,21 @@ export class NetworkClient {
     // SDK-auth refresh is a distinct ONE-SHOT retry, kept out of the
     // backoff loop below so it can never loop or consume a backoff attempt.
     let sdkAuthRefreshAttempted = false;
+    let storefrontRetryAttempted = false;
 
     while (attempt <= this.retryConfig.maxRetries) {
       try {
         this.logger.debug(`Request attempt ${attempt + 1}/${this.retryConfig.maxRetries + 1}: ${method} ${url}`);
 
-        let { response, responseData } = await this.performFetch(url, method, headers, body, request.subjectUserId);
+        let { response, responseData } = await this.performFetch(url, method, headers, body, request.subjectUserId, bodyAnonymousId);
+
+        // --- Storefront identity token refused (D383): refresh or drop, retry once ---
+        if (!storefrontRetryAttempted && this.isStorefrontIdentityError(response.status, responseData)) {
+          storefrontRetryAttempted = true;
+          if (await this.handleStorefrontIdentityError(responseData)) {
+            ({ response, responseData } = await this.performFetch(url, method, headers, body, request.subjectUserId, bodyAnonymousId));
+          }
+        }
 
         // --- SDK authentication: one-shot refresh + retry (out-of-band) ---
         // On a 401 sdk_authentication_error, fire the host callback to obtain a
@@ -778,7 +947,7 @@ export class NetworkClient {
           });
           if (fresh) {
             this.logger.debug('SDK authentication token refreshed – retrying request once');
-            ({ response, responseData } = await this.performFetch(url, method, headers, body, request.subjectUserId));
+            ({ response, responseData } = await this.performFetch(url, method, headers, body, request.subjectUserId, bodyAnonymousId));
           }
         }
 
@@ -919,6 +1088,7 @@ export class NetworkClient {
     callerHeaders: Record<string, string>,
     body: string | undefined,
     subjectUserId?: string | null,
+    bodyAnonymousId?: string | null,
   ): Promise<{ response: Response; responseData: any }> {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), this.retryConfig.timeoutMs || 10_000);
@@ -927,9 +1097,11 @@ export class NetworkClient {
       'Content-Type': 'application/json',
       'X-SDK-Key': this.sdkKey,
       ...callerHeaders,
+      ...sdkIdentityHeaders(),
     };
     // Attach the SDK-auth JWT last so the managed token is authoritative.
-    const authToken = this.sdkAuthTokenFor(subjectUserId);
+    // An anonymous request may carry the storefront identity token instead (D383).
+    const authToken = this.sdkAuthTokenFor(subjectUserId) ?? this.storefrontTokenFor(subjectUserId, bodyAnonymousId);
     if (authToken) {
       headers[SDK_AUTH_HEADER] = authToken;
     }
@@ -1088,8 +1260,10 @@ export class NetworkClient {
     const headers: Record<string, string> = {
       'Content-Type': 'application/json',
       'X-SDK-Key': this.sdkKey,
+      ...sdkIdentityHeaders(),
     };
-    const authToken = this.sdkAuthTokenFor(identifiedUserOf(body));
+    const subject = identifiedUserOf(body);
+    const authToken = this.sdkAuthTokenFor(subject) ?? this.storefrontTokenFor(subject, anonymousIdOfBody(body));
     if (authToken) {
       headers[SDK_AUTH_HEADER] = authToken;
     }
@@ -1145,6 +1319,34 @@ export class NetworkClient {
       },
       subjectUserId: userId,
     });
+  }
+
+  /**
+   * Click-link identity (D407): hand a tracked link's `jr_t` to the server,
+   * which attributes this anonymous visitor's events to the message's
+   * recipient when the token verifies (attribution only - never a merge). Anonymous by construction (no subject user); the
+   * answer is only `{ success, status: 'ok' | 'ignored' }`.
+   */
+  async sendIdentifyLink(apiEndpoint: string, payload: { token: string; anonymousId: string }): Promise<NetworkResponse> {
+    return this.request({
+      url: `${apiEndpoint}/v1/identify-link`,
+      method: 'POST',
+      body: { token: payload.token, anonymousId: payload.anonymousId },
+      subjectUserId: null,
+    });
+  }
+
+  /**
+   * A signed-in store customer's token (D383) is held for THIS visitor
+   * (expiring or not - the customer is signed in either way). A provider
+   * alone does not count: stores register one for guests too.
+   */
+  hasStorefrontIdentity(): boolean {
+    const token = this.storefrontToken;
+    if (!token) return false;
+    const claims = storefrontTokenClaims(token);
+    const current = this.anonymousIdSource ? this.anonymousIdSource() : null;
+    return !!claims && !!current && claims.vid === current;
   }
 
   /**

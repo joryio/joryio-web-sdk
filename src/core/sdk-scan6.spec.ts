@@ -136,7 +136,7 @@ describe('S1 / rule 61: replacing the token retires the outgoing one', () => {
 
   it('a retired token with nothing left queued survives a one-minute grace period, then goes', async () => {
     installFetch(authServer(() => false));
-    const sdk = new JoryioSDK({ ...BASE_CONFIG, trackSessionStart: false, enableSdkAuthentication: true, sdkAuthenticationToken: jwtFor('A'), userId: 'A' } as any);
+    const sdk = new JoryioSDK({ ...BASE_CONFIG, trackSessionStart: false, enableSdkAuthentication: true, sdkAuthenticationToken: jwtFor('A'), userId: 'A', webPush: true } as any);
     await sdk.reset();
     // A's last item (the push_permission attribute) settles...
     await waitFor(() => (sdk as any).identity.pending.isEmpty());

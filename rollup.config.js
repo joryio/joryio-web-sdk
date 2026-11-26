@@ -164,6 +164,54 @@ export default [
     ],
   },
 
+  // The point-and-click editor (D444 Phase 4 follow-up), its own file next to
+  // joryio.min.js on the SDK host (sdk.joryio.com/web/<version>/ and
+  // /web/<major>/ - infra/scripts/publish-web-sdk.sh uploads every
+  // dist/joryio*.js). The core loads it only in a tab the dashboard opened for
+  // the editor, after the server vouched for the editor token
+  // (src/core/editor-gate.ts), so no visitor downloads it. No declarations:
+  // nothing imports it. Kept out of the size budget of joryio.min.js and
+  // budgeted on its own (size-budget.json).
+  {
+    input: 'src/editor/index.ts',
+    plugins: [
+      resolve({ browser: true, preferBuiltins: false }),
+      commonjs(),
+      typescript({ tsconfig: './tsconfig.json', declaration: false, declarationDir: undefined, inlineSources: true, rootDir: './src', outDir: './dist' }),
+      terser({ format: { comments: /^!/, preamble: banner }, compress: { passes: 2 }, mangle: { properties: { regex: /^_[^_]/ } } }),
+    ],
+    output: {
+      file: 'dist/joryio-editor.min.js',
+      format: 'iife',
+      sourcemap: true,
+      sourcemapPathTransform: portableSourcePath,
+    },
+  },
+
+  // The default card feed renderer (mountCardFeed's drawing code), its own
+  // file next to joryio.min.js on the SDK host like the editor above
+  // (publish-web-sdk.sh uploads every dist/joryio*.js; sdk-release.yml checks
+  // it is in the npm pack). The core loads it the first time a page mounts a
+  // feed (src/core/cards.ts, contract src/core/cards-ui-contract.ts); the card
+  // data API stays in the core. ALSO the file a bundler user imports to skip
+  // that fetch, so the ESM / CJS builds below stay as they are and the
+  // renderer is never inlined into them. Budgeted on its own (size-budget.json).
+  {
+    input: 'src/cards-ui/index.ts',
+    plugins: [
+      resolve({ browser: true, preferBuiltins: false }),
+      commonjs(),
+      typescript({ tsconfig: './tsconfig.json', declaration: false, declarationDir: undefined, inlineSources: true, rootDir: './src', outDir: './dist' }),
+      terser({ format: { comments: /^!/, preamble: banner }, compress: { passes: 2 }, mangle: { properties: { regex: /^_[^_]/ } } }),
+    ],
+    output: {
+      file: 'dist/joryio-cards-ui.min.js',
+      format: 'iife',
+      sourcemap: true,
+      sourcemapPathTransform: portableSourcePath,
+    },
+  },
+
   // ESM build (bundlers via `module`/`exports.import`, and Node ESM). `.mjs`
   // so Node loads it as ESM: as `.js` in a package without "type": "module"
   // Node read it as CommonJS, and `import JoryioSDK from '@joryio/web-sdk'`

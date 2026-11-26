@@ -3,6 +3,10 @@
  * Main SDK class
  */
 
+import { PageEditManager } from './page-edits';
+import { EditorGate, editorFrame, editorRequested } from './editor-gate';
+import { PageContextTracker } from './page-context';
+import { ShowWhenMoments, type RecheckEvent } from './show-when';
 import { InitConfig, ResolvedConfig, resolveConfig, SDK_VERSION } from './config';
 import { StorageManager } from './storage';
 import { SessionManager, SESSION_ID_KEY } from './session';
@@ -13,10 +17,16 @@ import {
   NetworkResponse,
   AttributeOps,
   SdkAuthFailureCallback,
+  StorefrontIdentityTokenProvider,
   utf8Length,
 } from './network';
 import { UTMManager } from './utm';
 import { InAppMessagingManager, InAppCampaign } from './inapp';
+import { PlacementManager, Placement, PlacementHandle, InsertPlacementOptions, PlacementsUpdatedCallback, PlacementConsent } from './placements';
+import { CardManager, Card, CardFeed, CardFeedHandle, CardsUpdatedCallback, GetCardsOptions, MountCardFeedOptions } from './cards';
+import { JoryioSubscription, joryioSubscription } from './subscription';
+import { LinkRouter, JoryioLinkHandler } from './links';
+import { FlagsManager, FlagsUpdatedCallback, FLAG_EXPOSURE_MARKS_MAX, exposureMarks } from './flags';
 import { User } from './user';
 import { Logger } from '../utils/logger';
 import { getDeviceProperties } from './device';
@@ -32,6 +42,8 @@ import {
 } from './write-retry';
 import { WriteOutbox, OutboxEntry, OUTBOX_KEY } from './outbox';
 import { valueProblem, withoutUnsendableValues } from './values';
+import { resetToRefusal, rememberSignedInAnonymousId, SIGNED_IN_ANONYMOUS_IDS_KEY } from './reset-to';
+import { consumeClickIdentityTokenFromLocation, readClickIdentityToken, withoutClickIdentityToken } from './click-identity';
 
 /**
  * The visitor's own opt-out, persisted so it survives a reload. It used to
@@ -251,6 +263,21 @@ export class JoryioSDK {
   private network!: NetworkClient;
   private utm!: UTMManager;
   private inapp!: InAppMessagingManager;
+  /** Placements: spots inside the page filled per visitor (placements.ts). */
+  private placements!: PlacementManager;
+  /** Content cards: the person's feed (cards.ts). */
+  private cards!: CardManager;
+  // Created with the instance, so setLinkHandler works before init().
+  private links = new LinkRouter((error) => this.logger?.error('Your link handler threw; the link opens as without one:', error));
+  private pageContext!: PageContextTracker;
+  /** Show when (D465): this page view's moments and this visit's event names, for placements and page edits. */
+  private showWhen!: ShowWhenMoments;
+  /** Show when re-checks waiting for their event to reach the server (see recheckShowWhen). */
+  private pendingRechecks: Array<{ event: RecheckEvent; keys: string[]; edits: boolean; who: string; at: number }> = [];
+  private pageEdits!: PageEditManager;
+  private editor: EditorGate | null = null;
+  /** Feature flags + remote config (flags.ts). */
+  private flags!: FlagsManager;
   private _user!: User;
   private _push!: PushManager;
   private _ecommerce: EcommerceTracker | null = null;
@@ -290,6 +317,15 @@ export class JoryioSDK {
   private pruneTimer: ReturnType<typeof setTimeout> | null = null;
 
   /**
+   * Click-link identity (D407): a tracked link's `jr_t`, held IN MEMORY ONLY
+   * until it may be sent (consent pending) - never persisted, dropped on an
+   * opt-out, a denial or a reset. See click-identity.ts.
+   */
+  private pendingLinkToken: string | null = null;
+  /** Tokens already handed to the server by this page (send once). */
+  private readonly sentLinkTokens = new Set<string>();
+
+  /**
    * @param preInit - internal: privacy decisions queued before the SDK loaded
    *   (see installSnippetQueue). Not part of the public API.
    */
@@ -317,6 +353,9 @@ export class JoryioSDK {
     if (keyProblem) {
       // eslint-disable-next-line no-console -- the logger is silent by default and this is the reason nothing works
       console.error(`[Joryio] SDK not started: ${keyProblem}. Calls on this instance are ignored.`);
+      this.disabled = true;
+    } else if (editorFrame()) {
+      // The page editor's Mobile view (a frame in the editor tab): a preview, not a visit - nothing is sent or applied.
       this.disabled = true;
     }
 
@@ -350,11 +389,21 @@ export class JoryioSDK {
     if (this.userOptedOut) this.optedOutAt = this.storedStamp(OPT_OUT_AT_KEY);
     this.trackingConsent = this.initialConsent(this.config.trackingConsent);
 
+    // Click-link identity (D407): take `jr_t` off the address bar FIRST - before
+    // the UTM manager records the landing page - so the token is never
+    // bookmarked, shared, or stored as a landing URL. Stripped whatever the
+    // privacy state (hygiene, not collection); used only when allowed.
+    const linkToken = consumeClickIdentityTokenFromLocation();
+    if (linkToken && !this.disabled) this.pendingLinkToken = linkToken;
+
     // Initialize UTM tracking (before session to check for campaign changes)
+    // `captureUTM: false` keeps nothing from the URL in storage - no UTM
+    // values, referrer or landing page (1.4.0-beta.15).
     this.utm = new UTMManager(
       this.storage,
       this.logger,
       this.config.resetSessionOnNewCampaign,
+      this.config.captureUTM,
     );
 
     // Check if we should reset session due to new campaign
@@ -436,6 +485,16 @@ export class JoryioSDK {
       }
     }
 
+    // Storefront identity token (D383): bound to the visitor id it was minted
+    // for, read live from identity so a reset() (new visitor) never sends it.
+    this.network.setAnonymousIdSource(() => this.identity.getAnonymousId());
+    if (this.config.storefrontIdentityTokenProvider) {
+      this.network.setStorefrontIdentityTokenProvider(this.config.storefrontIdentityTokenProvider);
+    }
+    if (this.config.storefrontIdentityToken) {
+      this.network.setStorefrontIdentityToken(this.config.storefrontIdentityToken);
+    }
+
     this.outbox = this.createOutbox();
 
     // Initialize in-app messaging. The bridge lets in-app message HTML call SDK
@@ -502,6 +561,100 @@ export class JoryioSDK {
     // false, so every HTML campaign is refused with no way to opt in.
     this.inapp.setAllowHtmlJsInAppMessages(this.config.inApp.allowHtmlJsInAppMessages);
 
+    // Page context (D444 Phase 4): one tracker for overlays, placements and page edits.
+    this.pageContext = new PageContextTracker(this.config.pageContext);
+    // UTM page rules (D444 Phase 4 follow-up): the UTM this SDK already recorded, when capture is on.
+    this.pageContext.setUtmSource(() => (this.config.captureUTM && this.utm ? this.utm.getUTMData() : null));
+    this.inapp.setPageContext(this.pageContext);
+    this.showWhen = new ShowWhenMoments(this.pageContext, () => this.session.getSessionId(), this.config.sdkKey);
+    // A re-check belongs to its page view: a route change drops the waiting ones.
+    this.pageContext.onSignal((s) => {
+      if (s.type === 'page_change') this.pendingRechecks = [];
+    });
+
+    this.placements = new PlacementManager(
+      this.config.apiEndpoint,
+      this.config.sdkKey,
+      this.identity,
+      this.session,
+      this.logger,
+      {
+        consent: () => this.placementConsent(),
+        allowHtml: () => this.config.inApp.allowHtmlJsInAppMessages,
+        requestTimeoutMs: this.config.requestTimeout,
+        noteStatus: (status, data) => this.network.noteSuspended(status, data),
+        bridge: {
+          logCustomEvent: (name, properties) => this.track(name, properties),
+          setCustomUserAttribute: (key, value) => this.setAttribute(key, value),
+          changeUser: (userId) => this.identify(userId),
+          requestPushPermission: () => {
+            this._push.subscribe().catch((error) => this.logger.warn('Push subscribe failed:', error));
+          },
+        },
+      },
+      this.network,
+    );
+    this.placements.setPageContext(this.pageContext);
+    this.placements.setShowWhen(this.showWhen);
+
+    // Page edits (D444 Phase 4): selector edits from page-edit campaigns.
+    this.pageEdits = new PageEditManager(
+      this.config.apiEndpoint,
+      this.config.sdkKey,
+      this.identity,
+      this.session,
+      this.logger,
+      {
+        consent: () => this.placementConsent(),
+        requestTimeoutMs: this.config.requestTimeout,
+        noteStatus: (status, data) => this.network.noteSuspended(status, data),
+      },
+      this.network,
+    );
+    this.pageEdits.setPageContext(this.pageContext);
+    this.pageEdits.setShowWhen(this.showWhen);
+
+    this.cards = new CardManager(
+      this.config.apiEndpoint,
+      this.config.sdkKey,
+      this.identity,
+      this.session,
+      this.logger,
+      {
+        consent: () => this.placementConsent(),
+        requestTimeoutMs: this.config.requestTimeout,
+        noteStatus: (status, data) => this.network.noteSuspended(status, data),
+        cardsUiScriptUrl: this.config.cardsUiScriptUrl,
+      },
+      this.network,
+    );
+
+    // One link router for every surface that opens a link (setLinkHandler).
+    this.inapp.links = this.links;
+    this.placements.links = this.links;
+    this.cards.links = this.links;
+
+    this.flags = new FlagsManager(
+      this.config.apiEndpoint,
+      this.config.sdkKey,
+      this.identity,
+      this.session,
+      this.logger,
+      {
+        canSend: () => this.isInitialized && !this.disabled && !this.network.isSuspended() && this.canSend(),
+        requestTimeoutMs: this.config.requestTimeout,
+        noteStatus: (status, data) => this.network.noteSuspended(status, data),
+        // The attributes set on this device in this session (setAttributes,
+        // push_permission), as iOS and Android send them: rules on them match.
+        attributes: () => this.identity.getAttributes(),
+        // A batch the server did not take goes to the persisted outbox, as it
+        // was sent (1.4.0-beta.13); waiting there counts as already exposed.
+        enqueueExposures: (body, retryAfterMs) => this.enqueueExposures(body, retryAfterMs),
+        pendingExposures: () => this.outbox.records().filter((r) => r.kind === 'exposures').map((r) => r.payload),
+      },
+      this.network,
+    );
+
     // Initialize user object for subscription management
     this._user = new User(
       this.logger,
@@ -528,6 +681,8 @@ export class JoryioSDK {
         getDeviceId: () => this.deviceId,
         // The new permission is reported now, not on the next page load.
         onSubscribeSettled: () => this.reportPushPermissionIfChanged(),
+        // A primer is about to ask: the site uses web push, so report now.
+        onPrepared: () => this.reportPushPermissionIfChanged(),
       },
     );
 
@@ -548,6 +703,8 @@ export class JoryioSDK {
       try {
         return await this.flushEvents(events, identify);
       } finally {
+        // A batch settled: re-checks whose event has now left the queue go (after the queue's own bookkeeping).
+        if (this.pendingRechecks.length) setTimeout(() => this.runRechecks(), 0);
         // A logged-out user's token lives as long as their leftovers (D-a).
         this.scheduleRetiredTokenPrune();
       }
@@ -614,7 +771,28 @@ export class JoryioSDK {
     if (!this.disabled) JoryioSDK.instance = this;
     this.logger.info('SDK initialized successfully');
 
-    // Report permission state now the SDK is live. Only sends on a change.
+    // <div data-joryio-placement="key"> elements, now and as the page changes.
+    if (!this.disabled && this.config.inApp.autoMountPlacements) this.placements.autoMount();
+    // Route changes, scroll depth, time on page, exit intent (D444 Phase 4).
+    if (!this.disabled) this.pageContext.start();
+    // `pageEdits: false` (init): no page edit, no anti-flicker, no editor - whatever the server says.
+    if (!this.disabled && this.config.pageEdits) {
+      if (editorRequested()) {
+        // The dashboard's point-and-click editor opened this tab: the page as
+        // the site draws it (no page edits), and the picker once the token is
+        // vouched for - only then is the editor's own file loaded. Nothing
+        // happens for a tab that was not opened that way.
+        this.editor = new EditorGate(this.config.apiEndpoint, this.config.sdkKey, this.logger, { scriptUrl: this.config.editorScriptUrl });
+        this.editor.start();
+      } else {
+        this.pageEdits.start();
+      }
+    }
+    // Flags: the stored answer is readable at once; refresh it now and when the page is shown again.
+    if (!this.disabled) this.flags.start();
+
+    // Report permission state now the SDK is live - only when this site uses
+    // web push (see pushPermissionReported), and only on a change.
     this.reportPushPermissionIfChanged();
 
     // Enqueue Session Start BEFORE starting the queue auto-flush timer.
@@ -694,6 +872,10 @@ export class JoryioSDK {
     // An identify() made while tracking was off on an earlier page view, now
     // that it is allowed (D-b).
     if (!this.isOptedOut) this.releaseDeferredIdentify();
+
+    // A tracked link's `jr_t` (D407): now if tracking is allowed, at the
+    // grant if consent is pending, never if it is off.
+    this.flushLinkIdentity();
 
     // The opt-out marker, if the switch changed since the server last heard
     // (an `optOut: true` in the config or a pre-init optOut() included).
@@ -913,6 +1095,7 @@ export class JoryioSDK {
         if (anonymousId === this.identity.getAnonymousId() && userId === this.identity.getUserId()) return;
         this.logger.info('Another tab changed the visitor identity; following it');
         const loggedOut = anonymousId !== this.identity.getAnonymousId();
+        const previousUserId = this.identity.getUserId();
         // The same bookkeeping reset() / identify() does here (rule 62):
         // in-app first (dismissed as the outgoing user, with their token)...
         if (this.config.inApp.enabled) this.inapp.clearAll();
@@ -922,6 +1105,14 @@ export class JoryioSDK {
         this.pinAnonymousWrites();
         this.network.switchUser(userId);
         this.identity.adopt(anonymousId, userId);
+        this.placements.invalidate();
+        this.pendingRechecks = []; // never run a re-check queued for another person or consent
+        // Another person: the anonymous visitor's card state goes too.
+        this.cards.invalidate(true);
+        this.pageEdits?.invalidate();
+        // The other tab cleared the stored exposure marks already (reset / a different person).
+        if (loggedOut || (!!previousUserId && previousUserId !== userId)) this.flags.clearExposureMarks(false);
+        this.flags.onIdentityChanged();
         // Whoever was kept for withdrawals here belongs to the old identity.
         this.withdrawalUserId = null;
         if (loggedOut) {
@@ -1074,6 +1265,8 @@ export class JoryioSDK {
         return { url: `${endpoint}/v1/subscriptions/channel`, body: { ...record.payload, ...ids } };
       case 'group':
         return { url: `${endpoint}/v1/subscriptions/group`, body: { ...record.payload, ...ids } };
+      case 'exposures':
+        return { url: `${endpoint}/v1/flags/exposures`, body: { ...record.payload, ...ids } };
       case 'marker':
       default:
         return {
@@ -1084,6 +1277,29 @@ export class JoryioSDK {
           },
         };
     }
+  }
+
+  /**
+   * A flag exposures batch the server did not take: into the outbox as it was
+   * sent. At most FLAG_EXPOSURE_MARKS_MAX exposures wait there (the oldest
+   * batch goes first), so exposures never crowd out the profile writes.
+   *
+   * It counts as having failed once (1.4.0-beta.14): its first outbox attempt
+   * waits the first backoff step, or the failed send's Retry-After when
+   * longer - never the immediate re-send the kick after enqueue used to make.
+   */
+  private enqueueExposures(body: Record<string, unknown>, retryAfterMs?: number): void {
+    const count = () => this.outbox.records().reduce((n, r) => n + (r.kind === 'exposures' ? exposureMarks(r.payload).length : 0), 0);
+    const incoming = exposureMarks(body).length;
+    while (count() + incoming > FLAG_EXPOSURE_MARKS_MAX) {
+      const oldest = this.outbox.find((e) => e.record.kind === 'exposures');
+      if (!oldest) break;
+      this.outbox.cancel((e) => e === oldest);
+    }
+    this.outbox.enqueue(
+      { kind: 'exposures', payload: body as Extract<WriteRecord, { kind: 'exposures' }>['payload'] },
+      { afterFailedSend: true, retryAfterMs },
+    );
   }
 
   /** The opt-out marker's attribute write: the switch's value, `true` or `false`. */
@@ -1102,6 +1318,8 @@ export class JoryioSDK {
         return this.network.sendSubscriptionUpdate(endpoint, { ...record.payload, ...ids });
       case 'group':
         return this.network.sendSubscriptionGroupUpdate(endpoint, { ...record.payload, ...ids });
+      case 'exposures':
+        return this.flags.sendExposures({ ...record.payload, ...ids });
       case 'marker':
       default:
         return this.network.sendSetAttributes(
@@ -1115,6 +1333,8 @@ export class JoryioSDK {
 
   /** Bookkeeping when a write leaves the outbox. */
   private onWriteSettled(entry: OutboxEntry, outcome: 'done' | 'drop'): void {
+    // Taken, or refused for good: never sent again, so its marks are stored.
+    if (entry.record.kind === 'exposures') return this.flags.exposuresSettled(entry.record.payload);
     if (entry.record.kind !== 'marker') return;
     const value = entry.record.payload.value;
     if (outcome === 'done') {
@@ -1309,6 +1529,16 @@ export class JoryioSDK {
     if (wasOptedOut !== this.isOptedOut || wasPending !== this.consentPending) {
       // In-app answers requested under the previous state are stale.
       this.inapp.invalidate();
+      // Placement answers too: a grant turns generic answers personal, a
+      // refusal turns personal answers generic.
+      this.placements?.invalidate();
+      this.pendingRechecks = []; // never run a re-check queued for another person or consent
+      // The card feed is asked for only with consent: a grant fetches it, a refusal empties it.
+      this.cards?.invalidate(false);
+      // Consent changed: the stored site settings go too (as every per-workspace store).
+      this.pageEdits?.invalidate({ siteSettings: true });
+      // Flags too: without consent nothing is read or sent; a grant fetches.
+      this.flags?.onIdentityChanged();
     }
 
     if (this.isOptedOut) {
@@ -1337,6 +1567,8 @@ export class JoryioSDK {
       this.outbox.discardNonWithdrawals();
       this.outbox.kick();
       if (this.config.inApp.enabled) this.inapp.stop();
+      // A tracked link's token is never sent after a refusal.
+      this.pendingLinkToken = null;
       return;
     }
 
@@ -1370,6 +1602,67 @@ export class JoryioSDK {
       });
     }
     this._push.syncExistingSubscription().catch(() => undefined);
+    // A tracked link's token held while consent was pending (D407).
+    this.flushLinkIdentity();
+  }
+
+  /**
+   * Recognise the person who clicked a message (D407): send a tracked link's
+   * `jr_t` to POST /v1/identify-link, so this anonymous visit is the
+   * recipient's. Only when tracking is allowed (consent granted, not opted
+   * out, Do Not Track respected) and nobody is identified here: an
+   * identify()-ed user or a signed-in store customer (storefront identity
+   * token) always wins over a link - the server enforces the same and also
+   * keeps a browser that is already someone else as that person. Consent
+   * pending: held in memory and sent at the grant. Each token once per page.
+   */
+  private flushLinkIdentity(): void {
+    const token = this.pendingLinkToken;
+    if (!token) return;
+    if (this.disabled || this.isOptedOut) {
+      this.pendingLinkToken = null;
+      return;
+    }
+    if (!this.canSend()) return; // consent pending / ingestion paused: keep it for the grant
+    this.pendingLinkToken = null;
+    if (this.sentLinkTokens.has(token)) return;
+    if (this.effectiveUserId()) {
+      this.logger.debug('Link identity not sent: a user is identified on this browser');
+      return;
+    }
+    if (this.network.hasStorefrontIdentity()) {
+      this.logger.debug('Link identity not sent: a signed-in store customer is on this browser');
+      return;
+    }
+    this.sentLinkTokens.add(token);
+    this.network
+      .sendIdentifyLink(this.config.apiEndpoint, { token, anonymousId: this.identity.getAnonymousId() })
+      .catch((error) => this.logger.debug('Link identity request failed:', error));
+  }
+
+  /**
+   * Recognise the person who clicked a tracked link, for a page that handles
+   * URLs itself (a single-page app's router, a link opened in a webview).
+   * Reads `jr_t` from `url`; when `url` is the address bar's, also removes
+   * the token from it. The same rules as on page load: only when tracking
+   * is allowed and nobody is identified here. Does nothing without `jr_t`.
+   */
+  identifyFromLink(url: string): void {
+    if (!this.isInitialized || this.disabled) return;
+    const token = readClickIdentityToken(url);
+    if (!token) return;
+    try {
+      if (typeof window !== 'undefined' && window.location && readClickIdentityToken(window.location.href) === token) {
+        const stripped = withoutClickIdentityToken(window.location.href);
+        if (stripped && window.history && typeof window.history.replaceState === 'function') {
+          window.history.replaceState(window.history.state, '', stripped);
+        }
+      }
+    } catch {
+      // Hygiene only.
+    }
+    this.pendingLinkToken = token;
+    this.flushLinkIdentity();
   }
 
   /** Send the attribute and profile writes held while consent was pending. */
@@ -1569,7 +1862,12 @@ export class JoryioSDK {
 
       // Merge event properties with UTM parameters if enabled
       if (this.config.captureUTM) {
+        // An event's own landing_page wins over the stored one: Session Start
+        // sends the full landing address (the server builds the first Page
+        // Viewed from it), while storage keeps only origin + path.
+        const own = eventProperties.landing_page;
         Object.assign(eventProperties, this.utm.getUTMProperties());
+        if (own !== undefined) eventProperties.landing_page = own;
       }
 
       // Always include device_id in event properties for tracking
@@ -1639,6 +1937,10 @@ export class JoryioSDK {
       if (this.canSend()) {
         try {
           this.inapp?.onEventTracked(eventName, eventProperties);
+          this.placements?.onEventTracked(eventName, eventProperties);
+          // Show when: content held for this event shows now, and the answers that depend on it are asked again.
+          this.showWhen?.noteEvent(eventName);
+          this.recheckShowWhen(eventName, processedEvent);
         } catch (error) {
           this.logger.error('In-app trigger evaluation failed:', error);
         }
@@ -1662,6 +1964,57 @@ export class JoryioSDK {
     } catch (error) {
       // Never throw into the host page.
       this.logger.error('track() failed:', error);
+    }
+  }
+
+  /**
+   * Show when (D465): `eventName` was tracked and an answer depends on it
+   * (`recheckOn`, or held content waiting on it). The re-check never reaches
+   * the server before the event: the queue is flushed (after any flush in
+   * progress), and those placement keys and this page's edits are asked again
+   * only once the event has left the queue - delivered - past the 30 s
+   * placement limit, once per (key or page, event) per page view. A failed
+   * flush keeps it waiting; it runs once, after the next flush that delivers
+   * the event. The request carries the event (`recheckEvent`), so the server
+   * counts it even before its own write of the event lands.
+   */
+  private recheckShowWhen(eventName: string, queued: QueuedEvent): void {
+    const keys = this.placements?.recheckKeysFor(eventName) || [];
+    const edits = !!this.pageEdits?.claimRecheck(eventName);
+    if (!keys.length && !edits) return;
+    const event: RecheckEvent = { name: eventName, eventId: queued.eventId, properties: { ...(queued.properties || {}) } };
+    // Stamped with who it is for (identity, consent, page); at most 20, the oldest dropped.
+    this.pendingRechecks.push({ event, keys, edits, who: this.recheckOwner(), at: Date.now() });
+    if (this.pendingRechecks.length > 20) this.pendingRechecks.shift();
+    void this.queue
+      .flush(false, true)
+      .catch(() => undefined)
+      .then(() => this.runRechecks());
+  }
+
+  /** Who a re-check is for: the visitor, the consent and the page it was queued on. */
+  private recheckOwner(): string {
+    return [this.identity.getUserId() || '', this.identity.getAnonymousId(), this.placementConsent() || '', this.pageContext?.current().url || ''].join('\u0000');
+  }
+
+  /**
+   * Run the waiting re-checks whose event is no longer queued or in flight.
+   * One queued for another person, consent or page, or older than 60 s, is
+   * dropped - its event (and properties) never ride on someone else's request.
+   */
+  private runRechecks(): void {
+    if (!this.pendingRechecks.length || !this.isInitialized) return;
+    const owner = this.recheckOwner();
+    const now = Date.now();
+    this.pendingRechecks = this.pendingRechecks.filter((r) => r.who === owner && now - r.at <= 60_000);
+    const waiting = new Set([...this.queue.getQueuedEvents(), ...this.queue.getInflightEvents()].map((e) => e.eventId));
+    const due = this.pendingRechecks.filter((r) => !waiting.has(r.event.eventId));
+    if (!due.length) return;
+    this.pendingRechecks = this.pendingRechecks.filter((r) => waiting.has(r.event.eventId));
+    if (!this.canSend()) return;
+    for (const r of due) {
+      if (r.keys.length) void this.placements.recheck(r.keys, r.event);
+      if (r.edits) this.pageEdits.recheck(r.event);
     }
   }
 
@@ -1715,7 +2068,16 @@ export class JoryioSDK {
     // set is B's own. Also keeps the user id for auth-failure reporting.
     this.network.switchUser(userId);
     // In-app answers requested for the previous identity are stale.
-    if (previousUserId !== userId) this.inapp.invalidate();
+    if (previousUserId !== userId) {
+      this.inapp.invalidate();
+      this.placements.invalidate();
+      this.pendingRechecks = []; // never run a re-check queued for another person or consent
+      this.cards.invalidate(true);
+      this.pageEdits?.invalidate();
+      // Another person (as for attributes, beta.11): the session's exposure marks go.
+      if (switching) this.flags.clearExposureMarks();
+      this.flags.onIdentityChanged();
+    }
 
     if (!this.canSend()) return; // consent pending: sent when granted
 
@@ -1998,9 +2360,15 @@ export class JoryioSDK {
    *
    * Change-detection matters: attributes are not deduplicated server-side, so
    * reporting unconditionally would spend a request on every page load.
+   *
+   * And only when this site uses web push (pushPermissionReported): on a site
+   * that does not, the value says nothing anyone can act on, and writing it
+   * cost a request per new visitor - and, for an anonymous visitor the SDK
+   * sends nothing else for, created a profile of its own.
    */
   private reportPushPermissionIfChanged(): void {
     if (!this.isInitialized || this.isOptedOut) return;
+    if (!this.pushPermissionReported()) return;
     try {
       const state = this._push.getPermissionState();
       const current = state === 'notDetermined' ? 'not_determined' : state;
@@ -2014,6 +2382,23 @@ export class JoryioSDK {
     } catch (error) {
       this.logger.warn('Could not report push permission:', error);
     }
+  }
+
+  /**
+   * Does this SDK instance use web push, so `push_permission` is reported?
+   *
+   * - `webPush: true` in the init config: yes.
+   * - subscribe() was called, or prepare() succeeded, on this page: yes, even
+   *   with `webPush: false` - the page asked for push, and the answer counts.
+   * - `webPush: false`: no.
+   * - unset: yes once this browser has used Joryio web push (an earlier
+   *   subscribe() / prepare(), or a registration from an earlier version).
+   */
+  private pushPermissionReported(): boolean {
+    if (this.config.webPush === true) return true;
+    if (this._push.usedOnThisPage()) return true;
+    if (this.config.webPush === false) return false;
+    return this._push.usedEarlier();
   }
 
   /**
@@ -2153,12 +2538,66 @@ export class JoryioSDK {
    * on a shared device.
    */
   async reset(): Promise<void> {
+    return this.resetIdentity(undefined);
+  }
+
+  /**
+   * reset(), then adopt `anonymousId` instead of a new random id (BACKLOG
+   * D366). For a host that keeps its own visitor id - a store tracker, a
+   * site's own analytics id - so the SDK and the host stay ONE visitor after
+   * a logout, without a random id in between.
+   *
+   * Everything reset() does happens: the user id, attributes, in-app state,
+   * the SDK-authentication and storefront tokens and the session are
+   * forgotten, and the push subscription moves to the new visitor. The id
+   * must be 8 to 255 letters, digits, `.`, `_`, `:` or `-`, must not have the
+   * shape of a Joryio profile id (24 lowercase hex) and must not be the user
+   * id this SDK holds, nor the anonymous id it holds while a user is signed
+   * in (that id is tied to the signed-in user's profile); a refused id is
+   * logged and the call is a plain reset() - a random id - so a logout is
+   * never skipped.
+   *
+   * Resolves `true` when the id was adopted, `false` when it was refused (a
+   * random id was used instead) or the SDK is not initialized (nothing done).
+   *
+   * An anonymous id is a claim, not a credential: whoever holds an anonymous
+   * id that is already tied to an identified profile is treated as that
+   * visitor (in-app messages, events, push), unless SDK Authentication is on
+   * - then anonymous writes to an identified profile are refused (403). Adopt
+   * only ids your own app issued for this browser.
+   */
+  async resetTo(anonymousId: string): Promise<boolean> {
+    if (!this.isInitialized) {
+      this.logger.error('SDK not initialized');
+      return false;
+    }
+    const userId = this.identity.getUserId();
+    const refusal = resetToRefusal(
+      anonymousId,
+      [userId, this.withdrawalUserId],
+      userId ? this.identity.getAnonymousId() : null,
+      this.signedInAnonymousIds(),
+    );
+    if (refusal) this.logger.error(`${refusal}; a random anonymous id is used instead`);
+    await this.resetIdentity(refusal ? undefined : anonymousId);
+    return !refusal;
+  }
+
+  /** Anonymous ids tied to a signed-in user when a reset signed them out (D366). */
+  private signedInAnonymousIds(): string[] {
+    const stored = this.storage.get<unknown>(SIGNED_IN_ANONYMOUS_IDS_KEY);
+    return Array.isArray(stored) ? stored.filter((x): x is string => typeof x === 'string') : [];
+  }
+
+  private async resetIdentity(anonymousId: string | undefined): Promise<void> {
     if (!this.isInitialized) {
       this.logger.error('SDK not initialized');
       return;
     }
 
     this.logger.info('Resetting user identity');
+    // A link token held for the outgoing visitor is not the next one's (D407).
+    this.pendingLinkToken = null;
 
     // --- Synchronous: everything that decides WHO the next call is about ---
 
@@ -2183,13 +2622,30 @@ export class JoryioSDK {
     // Leftovers refused with a 401 anyway are dropped, never reported to the
     // host's handler.
     this.network.retireSdkAuthToken();
+    // The store customer's storefront identity token is theirs and this
+    // visitor's (D383): the next visitor never carries it. (It is bound to the
+    // old anonymous id anyway; dropped so it is not even held.)
+    this.network.clearStorefrontIdentityToken();
     // A user kept only for withdrawals (D-b) is logged out too.
     this.forgetDeferredIdentify();
 
+    // The outgoing user's anonymous id is tied to their profile: a later
+    // resetTo() must never hand it to someone else (D366).
+    if (this.identity.getUserId()) {
+      this.storage.set(SIGNED_IN_ANONYMOUS_IDS_KEY, rememberSignedInAnonymousId(this.signedInAnonymousIds(), this.identity.getAnonymousId()));
+    }
+
     // New anonymous id, no user id.
     this.pinAnonymousWrites();
-    this.identity.reset();
+    this.identity.reset(anonymousId);
+    this.flags.clearExposureMarks();
+    this.flags.onIdentityChanged();
     this.network.setCurrentUserId(this.identity.getUserId());
+    this.placements.invalidate();
+    this.pendingRechecks = []; // never run a re-check queued for another person or consent
+    this.cards.invalidate(true);
+    // reset / resetTo: the stored site settings go too (identify keeps them - the same for every visitor).
+    this.pageEdits?.invalidate({ siteSettings: true });
 
     // UTM before the session: the new session's Session Start (tracked by the
     // session's onNewSession hook) must not carry the outgoing user's campaign.
@@ -2230,6 +2686,7 @@ export class JoryioSDK {
       return;
     }
     this.logger.info('Wiping local SDK data');
+    this.pendingLinkToken = null;
 
     // Push first, while the outgoing ids are still current (it captures them).
     const pushWiped = this._push.forget().catch(() => undefined);
@@ -2257,6 +2714,9 @@ export class JoryioSDK {
     // under the ids they were made with (contract item 36).
     this.outbox.discardNonWithdrawals();
     this.storage.remove(REPORTED_PUSH_PERMISSION_KEY);
+    // Local data like any other (D366): resetTo's memory of signed-in users'
+    // anonymous ids goes with the wipe, the same on all five SDKs.
+    this.storage.remove(SIGNED_IN_ANONYMOUS_IDS_KEY);
     // "No Session Start queued for any session yet" - NOT the absence of the
     // marker, which reads as "sent" (rule 75): a wipe while tracking was off,
     // then a reload and a grant, resumed the post-wipe session with no
@@ -2288,10 +2748,20 @@ export class JoryioSDK {
     for (const key of [OUTBOX_KEY, PENDING_UNREGISTER_KEY]) collectUserIds(this.storage.get<unknown>(key), keepTokens);
     this.network.retireSdkAuthToken();
     this.network.dropStandbySdkAuthTokens(keepTokens);
+    this.network.clearStorefrontIdentityToken();
     this.forgetDeferredIdentify();
     this.pinAnonymousWrites();
+    // Wiped: no exposure read before it is ever sent (queued, or on the wire
+    // and then refused); the ones in the outbox go with its other writes.
+    this.flags.wipe();
     this.identity.reset();
+    this.flags.clearExposureMarks();
+    this.flags.onIdentityChanged();
     this.network.setCurrentUserId(null);
+    this.placements.invalidate();
+    this.pendingRechecks = []; // never run a re-check queued for another person or consent
+    this.cards?.invalidate(true);
+    this.pageEdits?.invalidate({ siteSettings: true });
     this.utm.reset();
     this.session.clear();
     this.lastTrackedUrl = null;
@@ -2772,6 +3242,32 @@ export class JoryioSDK {
   }
 
   /**
+   * Storefront identity token (store plugins) - set or replace the token
+   * Joryio minted for a signed-in store customer's browser (null forgets it).
+   * Sent only on anonymous requests of the visitor it was minted for. See
+   * the `storefrontIdentityToken` init option.
+   */
+  setStorefrontIdentityToken(token: string | null): void {
+    if (!this.isInitialized) {
+      this.logger?.error('SDK not initialized');
+      return;
+    }
+    this.network.setStorefrontIdentityToken(token);
+  }
+
+  /**
+   * Storefront identity token - register the function asked for a fresh token
+   * (before the held one expires, or when the API refused it as expired).
+   */
+  setStorefrontIdentityTokenProvider(provider: StorefrontIdentityTokenProvider | null): void {
+    if (!this.isInitialized) {
+      this.logger?.error('SDK not initialized');
+      return;
+    }
+    this.network.setStorefrontIdentityTokenProvider(provider);
+  }
+
+  /**
    * SDK Authentication — register a callback fired when the backend rejects the
    * token with a 401 `sdk_authentication_error`. The callback receives the
    * failure reason and the endpoint/user; mint a fresh JWT and either return it
@@ -3033,6 +3529,233 @@ export class JoryioSDK {
   }
 
   /**
+   * What a placement request may carry (docs/PLACEMENTS_PLAN.md 3.9): null =
+   * nothing may be sent at all; `granted` = the visitor is named and their
+   * interactions reported; `pending` / `denied` (opted out and Do Not Track
+   * included) = an anonymous request for generic content, nothing reported.
+   */
+  private placementConsent(): PlacementConsent | null {
+    if (!this.isInitialized || this.disabled || this.network.isSuspended()) return null;
+    if (this.canSend()) return 'granted';
+    return this.consentPending ? 'pending' : 'denied';
+  }
+
+  /**
+   * Receive EVERY link the SDK is about to open - an in-app message button or
+   * link, a placement button, a card click - before it opens: http(s) links
+   * and app deep links (`myapp://cart`) alike, with where it came from
+   * (`link.source`: in_app, placement, card) and the ids that go with it.
+   * Return true to take the link over - route it with your single-page app's
+   * router instead of a new tab - or false to let the SDK open it as it does
+   * without a handler. A refused scheme (javascript:, data:, ...) never
+   * reaches it. Synchronous on purpose: the click's user activation still
+   * holds when the SDK opens a tab. Works before init(). Same name on iOS,
+   * Android, React Native and Unity (`SetLinkHandler`).
+   */
+  setLinkHandler(handler: JoryioLinkHandler): void {
+    if (typeof handler !== 'function') {
+      this.logger?.warn('setLinkHandler() needs a function; use clearLinkHandler() to remove one');
+      return;
+    }
+    this.links.setHandler(handler);
+  }
+
+  /** Remove the handler set with setLinkHandler: links open as they do without one. */
+  clearLinkHandler(): void {
+    this.links.setHandler(null);
+  }
+
+  /**
+   * Draw placement `placementKey` into `element` (docs: Placements). The SDK
+   * fetches, caches and refreshes it, measures viewability and reports
+   * impressions, clicks and dismissals. Returns a handle whose `remove()`
+   * stops it; null for an invalid key or element.
+   */
+  /**
+   * The page's own variables for page targeting (D444 Phase 4), e.g.
+   * `{ pageType: 'product', category: 'shoes' }`. Replaces what was set
+   * before; `null` clears it. Primitives only, at most 20. Call it on every
+   * page (and after each route change in a single-page app). Safe before
+   * init.
+   */
+  setPageVariables(variables: Record<string, string | number | boolean> | null): void {
+    try {
+      this.pageContext?.setPageVariables(variables);
+    } catch (error) {
+      this.logger.warn('setPageVariables failed:', error);
+    }
+  }
+
+  insertPlacement(placementKey: string, element: HTMLElement, options?: InsertPlacementOptions): PlacementHandle | null {
+    if (!this.isInitialized) {
+      this.logger.error('SDK not initialized');
+      return null;
+    }
+    return this.placements.insertPlacement(placementKey, element, options);
+  }
+
+  /**
+   * The placements for `placementKeys`, to draw with your own UI. Report what
+   * the person did with `item.markDisplayed()` (once it was viewable),
+   * `item.markClicked()` and `item.markDismissed()`; for a held-out visitor
+   * (`isControl`), `placement.markDisplayed()` when the empty spot was viewable.
+   */
+  async getPlacements(placementKeys: string[]): Promise<Record<string, Placement>> {
+    if (!this.isInitialized) {
+      this.logger.error('SDK not initialized');
+      return {};
+    }
+    return this.placements.getPlacements(placementKeys);
+  }
+
+  /** Ask the server again (default: every placement on the page). At most once per key per PLACEMENT_MIN_REFRESH_SECONDS. */
+  async refreshPlacements(placementKeys?: string[]): Promise<void> {
+    if (!this.isInitialized) return;
+    await this.placements.refreshPlacements(placementKeys);
+  }
+
+  /** Called with the placements whose content changed. Returns a JoryioSubscription: `cancel()` it to stop (calling it is the same). */
+  onPlacementsUpdated(callback: PlacementsUpdatedCallback): JoryioSubscription {
+    if (!this.isInitialized) {
+      this.logger.error('SDK not initialized');
+      return joryioSubscription(() => undefined);
+    }
+    return this.placements.onPlacementsUpdated(callback);
+  }
+
+  /**
+   * The person's content cards (docs: Content cards): from the cache while it
+   * is fresh (CARD_FEED_TTL_SECONDS), from the server otherwise. With
+   * `{ cursor: feed.nextCursor }`, the next page - added to the cached feed.
+   * Without tracking consent the feed is empty and nothing is asked.
+   */
+  async getCards(options?: GetCardsOptions): Promise<CardFeed> {
+    if (!this.isInitialized) {
+      this.logger.error('SDK not initialized');
+      return { cards: [], unreadCount: 0, nextCursor: null, stateScope: 'server' };
+    }
+    return this.cards.getCards(options);
+  }
+
+  /** Unread cards in the cached feed (the badge). Never goes to the network. */
+  getUnreadCardCount(): number {
+    if (!this.isInitialized) return 0;
+    return this.cards.getUnreadCardCount();
+  }
+
+  /** Report that a card (or card id) was on screen - the feed drawn by mountCardFeed does this itself. */
+  markCardViewed(card: Card | string): void {
+    if (!this.isInitialized) return;
+    this.cards.markCardViewed(card);
+  }
+
+  /** Mark a card read: the unread count drops at once. A card already read sends nothing. */
+  markCardRead(card: Card | string): void {
+    if (!this.isInitialized) return;
+    this.cards.markCardRead(card);
+  }
+
+  /** Report a tap on a card (it counts as read too). Open `card.url` yourself when you draw the feed. */
+  markCardClicked(card: Card | string): void {
+    if (!this.isInitialized) return;
+    this.cards.markCardClicked(card);
+  }
+
+  /** Dismiss a card: it leaves the feed at once, on every device for a known person. */
+  dismissCard(card: Card | string): void {
+    if (!this.isInitialized) return;
+    this.cards.dismissCard(card);
+  }
+
+  /** Ask the server for the feed again. At most once per CARD_MIN_REFRESH_SECONDS; extra calls coalesce. */
+  async refreshCards(): Promise<void> {
+    if (!this.isInitialized) return;
+    await this.cards.refreshCards();
+  }
+
+  /**
+   * Called with the whole feed whenever it changes - the way to keep a feed UI
+   * of your own up to date. Returns a JoryioSubscription: `cancel()` it to stop
+   * (calling it, `sub()`, is the same).
+   */
+  onCardsUpdated(callback: CardsUpdatedCallback): JoryioSubscription {
+    if (!this.isInitialized) {
+      this.logger.error('SDK not initialized');
+      return joryioSubscription(() => undefined);
+    }
+    return this.cards.onCardsUpdated(callback);
+  }
+
+  /**
+   * Draw the person's card feed into `element` and keep it up to date. Cards
+   * are reported viewed and read once half of one was on screen for a second,
+   * clicked on a tap (then its http(s) link opens, or a deep link goes to
+   * `onDeepLink`), dismissed on its x. Returns a handle whose `remove()` stops it.
+   * The drawing code is `joryio-cards-ui.min.js`, loaded from the SDK host the
+   * first time a feed is mounted (`cardsUiScriptUrl` to self-host): the handle
+   * comes back at once and the feed appears when the file has loaded. If it
+   * cannot load, a warning is logged and the element gets
+   * `data-joryio-card-feed-state="unavailable"`; the data API keeps working.
+   */
+  mountCardFeed(element: HTMLElement, options?: MountCardFeedOptions): CardFeedHandle | null {
+    if (!this.isInitialized) {
+      this.logger.error('SDK not initialized');
+      return null;
+    }
+    return this.cards.mountCardFeed(element, options);
+  }
+
+  /**
+   * A flag's value for this visitor, or `defaultValue` before the first answer,
+   * for a flag the server did not send, or without tracking consent. Never
+   * waits for the network. The first read in a session logs an exposure.
+   */
+  getFlag<T = unknown>(key: string, defaultValue: T): T {
+    if (!this.isInitialized) return defaultValue;
+    return this.flags.getFlag(key, defaultValue);
+  }
+
+  /** A boolean flag, or `defaultValue` (also for a flag of another type). */
+  getBoolFlag(key: string, defaultValue: boolean): boolean {
+    return this.isInitialized ? this.flags.getBoolFlag(key, defaultValue) : defaultValue;
+  }
+
+  /** A string flag, or `defaultValue`. */
+  getStringFlag(key: string, defaultValue: string): string {
+    return this.isInitialized ? this.flags.getStringFlag(key, defaultValue) : defaultValue;
+  }
+
+  /** A number flag, or `defaultValue`. */
+  getNumberFlag(key: string, defaultValue: number): number {
+    return this.isInitialized ? this.flags.getNumberFlag(key, defaultValue) : defaultValue;
+  }
+
+  /** A JSON flag (object, array or scalar), or `defaultValue`. */
+  getJsonFlag<T = unknown>(key: string, defaultValue: T): T {
+    return this.isInitialized ? this.flags.getJsonFlag(key, defaultValue) : defaultValue;
+  }
+
+  /** Every flag held for this visitor, key -> value. Logs no exposure. */
+  getAllFlags(): Record<string, unknown> {
+    return this.isInitialized ? this.flags.getAllFlags() : {};
+  }
+
+  /** Fetch the flags now. */
+  async refreshFlags(): Promise<void> {
+    if (!this.isInitialized) return;
+    await this.flags.refreshFlags();
+  }
+
+  /** Called with the keys whose value changed. Returns a JoryioSubscription: `cancel()` it to stop (calling it is the same). */
+  onFlagsUpdated(callback: FlagsUpdatedCallback): JoryioSubscription {
+    if (!this.isInitialized) {
+      this.logger.error('SDK not initialized');
+      return joryioSubscription(() => undefined);
+    }
+    return this.flags.onFlagsUpdated(callback);
+  }
+
+  /**
    * Destroy the SDK instance
    */
   async destroy(): Promise<void> {
@@ -3093,6 +3816,14 @@ export class JoryioSDK {
     // Clear in-app messaging (every timer included)
     this.inapp.clearAll();
     this.inapp.destroy();
+    this.placements.destroy();
+    this.cards.destroy();
+    this.pageEdits?.destroy();
+    this.editor?.stop();
+    this.showWhen?.destroy();
+    this.pendingRechecks = [];
+    this.pageContext?.destroy();
+    this.flags.destroy();
 
     this.isInitialized = false;
     if (JoryioSDK.instance === this) JoryioSDK.instance = null;
